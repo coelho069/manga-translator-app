@@ -1,10 +1,36 @@
 # Manga Translator App
 
-Aplicativo web local para Windows que recebe uma página de mangá em inglês, detecta balões de fala, lê o texto com OCR, traduz para português, apaga o texto original e escreve a tradução dentro dos balões.
+Aplicativo local em Python com Streamlit para traduzir páginas de mangá em inglês para português.  
+O app recebe uma imagem, detecta balões de fala com YOLO segmentation, lê o texto com PaddleOCR, traduz com `deep-translator`, tenta apagar o texto original e renderiza a tradução dentro dos balões.
 
-O aplicativo usa Streamlit e roda no navegador local. O processamento padrão é em CPU.
+O processamento roda localmente no Windows e usa CPU por padrão.
 
-## Estrutura
+## Funcionalidades
+
+- Upload de imagens PNG, JPG e JPEG.
+- Pré-visualização da imagem original.
+- Detecção de balões de fala com YOLO segmentation.
+- OCR em inglês com PaddleOCR.
+- Tradução automática de inglês para português com `deep-translator`.
+- Limpeza do texto original dentro dos balões.
+- Renderização da tradução centralizada no balão.
+- Comparação lado a lado entre imagem original e traduzida.
+- Botão para baixar a imagem traduzida.
+- Execução local no navegador com Streamlit.
+- Geração de imagens de exemplo para testes.
+- Estrutura opcional de dataset e scripts de treino para melhorar o modelo de balões.
+
+## Demonstração / Fluxo
+
+1. Instale as dependências do projeto.
+2. Coloque o modelo YOLO em `models/bubble_seg.pt`.
+3. Rode o aplicativo Streamlit.
+4. Envie uma página de mangá em inglês.
+5. Clique em **Iniciar tradução**.
+6. Aguarde as etapas de detecção, OCR, tradução, limpeza e renderização.
+7. Baixe a imagem traduzida ou acesse o resultado em `output/`.
+
+## Estrutura do Projeto
 
 ```text
 manga-translator-app/
@@ -19,47 +45,100 @@ manga-translator-app/
     renderer.py
     pipeline.py
     backend.py
-  models/
-  output/
+  dataset/
+    bubbles/
   examples/
+    bubbles/
+    create_bubble_examples.py
+    create_sample.py
+  models/
+    bubble_seg.pt
+  output/
+  training/
+    train_bubble_model.py
+    predict_debug.py
   streamlit_app.py
+  requirements.txt
+  setup.ps1
+  run_app.ps1
 ```
 
-## Instalação no Windows
+### Arquivos principais
 
-Requisitos:
+- `app/detector.py`: carrega o modelo YOLO segmentation e detecta os balões de fala.
+- `app/ocr.py`: executa OCR em inglês com PaddleOCR e retorna textos/polígonos detectados.
+- `app/translator.py`: traduz o texto de inglês para português usando `deep-translator`.
+- `app/cleaner.py`: tenta remover o texto original dentro dos balões, preservando a borda.
+- `app/renderer.py`: quebra linhas, ajusta fonte e desenha a tradução dentro do balão.
+- `app/pipeline.py`: coordena o fluxo completo de detecção, OCR, tradução, limpeza e renderização.
+- `app/backend.py`: recebe a imagem enviada, cria diretório de saída e chama o pipeline.
+- `streamlit_app.py`: interface web local do aplicativo.
 
-- Windows
-- Python 3.10 instalado
-- PowerShell
+## Requisitos
 
-Na pasta do projeto, execute:
+- Windows.
+- Python 3.10.
+- PowerShell.
+- Ambiente virtual recomendado.
+- Processamento padrão em CPU.
+
+> Observação: algumas dependências, especialmente `torch`, `paddlepaddle`, `paddleocr` e `ultralytics`, podem ser pesadas. A instalação inicial pode demorar.
+
+## Instalação
+
+### A) Instalação rápida com script
+
+Na pasta raiz do projeto, execute:
 
 ```powershell
 .\setup.ps1
 ```
 
-O script cria `.venv`, instala PyTorch CPU, instala as dependências e cria as pastas necessárias.
+O script cria o ambiente virtual `.venv`, instala o PyTorch CPU, instala as dependências do `requirements.txt` e cria as pastas necessárias.
+
+### B) Instalação manual
+
+Na pasta raiz do projeto:
+
+```powershell
+py -3.10 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install torch==2.2.2 torchvision==0.17.2 torchaudio==2.2.2 --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -r requirements.txt
+```
 
 ## Modelo YOLO
 
-Coloque o modelo de segmentação de balões neste caminho:
+O aplicativo precisa de um modelo YOLO segmentation neste caminho:
 
 ```text
 models/bubble_seg.pt
 ```
 
-O modelo esperado deve ter a classe:
+Esse arquivo não vai para o Git por padrão, pois modelos `.pt` costumam ser grandes e podem variar conforme o treino.
 
-```python
-{0: "speech bubble"}
+O modelo esperado deve detectar a classe:
+
+```text
+speech bubble
 ```
 
-Sem esse arquivo, o aplicativo mostra uma mensagem clara informando que o modelo não foi encontrado.
+Para verificar as classes do modelo:
 
-## Como rodar
+```powershell
+python -c "from ultralytics import YOLO; m=YOLO('models/bubble_seg.pt'); print(m.names)"
+```
 
-Depois da instalação:
+O resultado esperado deve conter algo como:
+
+```python
+{0: 'speech bubble'}
+```
+
+## Como Executar
+
+Com o ambiente configurado:
 
 ```powershell
 .\run_app.ps1
@@ -72,76 +151,78 @@ Ou manualmente:
 python -m streamlit run streamlit_app.py
 ```
 
-O Streamlit abrirá o endereço local no navegador.
+O Streamlit abrirá o app no navegador local, normalmente em:
 
-## Como usar
+```text
+http://localhost:8501
+```
 
-1. Envie uma imagem PNG, JPG ou JPEG.
-2. Confira a pré-visualização.
-3. Clique em **Iniciar tradução**.
-4. Aguarde as etapas de progresso.
-5. Compare a imagem original e a traduzida lado a lado.
-6. Confira a lista de textos detectados.
-7. Baixe a imagem traduzida.
+## Como Usar
 
-As imagens processadas ficam em `output/`, separadas por diretório de trabalho.
+1. Abra o app no navegador.
+2. Envie uma imagem PNG, JPG ou JPEG.
+3. Opcionalmente, marque **Usar imagem de exemplo** para testar com arquivos de `examples/bubbles/`.
+4. Clique em **Iniciar tradução**.
+5. Acompanhe a barra de progresso.
+6. Compare a imagem original e a imagem traduzida lado a lado.
+7. Baixe a imagem traduzida pelo botão da interface.
+8. Também é possível encontrar os resultados em `output/`.
 
-## Criar imagem de teste
+## Linha de Comando / Testes
 
-Para gerar uma imagem simples de exemplo:
+Gerar uma página simples de teste:
 
 ```powershell
-.\.venv\Scripts\Activate.ps1
 python examples\create_sample.py
 ```
 
-Isso cria `examples/sample_manga_page.png`.
-
-## Criar exemplos de balões
-
-Para gerar um conjunto de imagens PNG simples com balões de fala:
+Gerar exemplos variados de balões:
 
 ```powershell
-.\.venv\Scripts\Activate.ps1
 python examples\create_bubble_examples.py
 ```
 
-As imagens serão criadas em:
+Verificar sintaxe dos principais arquivos Python:
 
-```text
-examples/bubbles/
+```powershell
+python -m compileall app streamlit_app.py examples
 ```
 
-Arquivos gerados:
+Rodar o app:
 
-- `simple_bubble_01.png`
-- `simple_bubble_02.png`
-- `simple_bubble_03.png`
-- `long_text_bubble.png`
-- `small_bubble.png`
-- `double_bubble.png`
-- `noisy_bubble.png`
+```powershell
+python -m streamlit run streamlit_app.py
+```
 
-No Streamlit, marque **Usar imagem de exemplo** para carregar uma dessas imagens sem fazer upload manual. O upload normal continua funcionando.
+## Melhorando a Detecção dos Balões
 
-## Melhorando a detecção dos balões
+A pasta `dataset/bubbles/` foi criada para organizar imagens anotadas e treinar ou fine-tunar um modelo YOLO segmentation melhor para balões de fala de mangá.
 
-A pasta `dataset/bubbles/` foi criada para organizar imagens anotadas e treinar/fine-tunar um modelo YOLO segmentation melhor para balões de fala de mangá.
+Importante: colocar imagens na pasta não melhora automaticamente o app. É preciso anotar os balões, treinar o modelo e depois substituir o peso usado pelo aplicativo.
 
-Importante: colocar imagens na pasta não melhora automaticamente o app. É preciso:
+Estrutura do dataset:
 
-1. Colocar imagens em `dataset/bubbles/images/train` e `dataset/bubbles/images/val`.
-2. Anotar os balões como segmentação/polígono YOLO, não apenas bbox.
-3. Salvar os labels correspondentes em `dataset/bubbles/labels/train` e `dataset/bubbles/labels/val`.
-4. Treinar/fine-tunar o modelo.
-5. Copiar o melhor peso treinado para `models/bubble_seg.pt`.
+```text
+dataset/bubbles/
+  images/
+    train/
+    val/
+  labels/
+    train/
+    val/
+  data.yaml
+```
 
-Exemplo de pares imagem/label:
+Cada imagem precisa ter um `.txt` com o mesmo nome na pasta de labels correspondente.
+
+Exemplo:
 
 ```text
 dataset/bubbles/images/train/page_001.png
 dataset/bubbles/labels/train/page_001.txt
 ```
+
+As labels devem estar no formato YOLO segmentation, com polígonos, não apenas bounding boxes.
 
 Classe única:
 
@@ -149,13 +230,13 @@ Classe única:
 0 = speech bubble
 ```
 
-Para treinar em CPU:
+Treinar em CPU:
 
 ```powershell
 python training/train_bubble_model.py --epochs 50 --imgsz 640 --batch 4 --device cpu
 ```
 
-Treino em CPU pode ser lento. Com GPU compatível, use algo como:
+Treino em CPU pode ser lento. Com GPU compatível, é possível usar:
 
 ```powershell
 python training/train_bubble_model.py --epochs 50 --imgsz 640 --batch 4 --device 0
@@ -167,35 +248,25 @@ Depois do treino, o melhor modelo geralmente fica em:
 runs/segment/train/weights/best.pt
 ```
 
-Para usar esse modelo no app, copie o arquivo para:
+Para usar o novo modelo no app, copie esse arquivo para:
 
 ```text
 models/bubble_seg.pt
 ```
 
-Para gerar imagens de debug com máscaras/bboxes desenhados:
+Gerar predições de debug:
 
 ```powershell
 python training/predict_debug.py --model models/bubble_seg.pt --source dataset/bubbles/images/val
 ```
 
-As predições serão salvas em:
+As imagens de debug serão salvas em:
 
 ```text
 output/debug_predictions/
 ```
 
-## Arquitetura
-
-- `detector.py`: carrega o YOLO e segmenta os balões.
-- `ocr.py`: usa PaddleOCR em inglês e converte polígonos locais para coordenadas globais.
-- `translator.py`: traduz com `deep-translator`, com cache e fallback para o texto original.
-- `cleaner.py`: cria máscara do texto, restringe à área interna do balão e aplica `cv2.inpaint`.
-- `renderer.py`: calcula área segura, quebra linhas e centraliza a tradução com PIL.
-- `pipeline.py`: coordena todas as etapas e salva a imagem final.
-- `streamlit_app.py`: interface local no navegador.
-
-## Problemas comuns
+## Problemas Comuns
 
 ### Modelo não encontrado
 
@@ -205,34 +276,76 @@ Verifique se o arquivo existe exatamente em:
 models/bubble_seg.pt
 ```
 
-### OCR lento na primeira execução
+Sem esse arquivo, o detector YOLO não consegue iniciar.
 
-O PaddleOCR pode baixar ou carregar modelos na primeira vez. Depois tende a ficar mais rápido.
+### Erro do Torch `shm.dll` no Windows
 
-### Tradução falhou
+Esse erro costuma estar relacionado à instalação do PyTorch ou a conflitos no ambiente Python. Tente recriar a `.venv` e instalar o PyTorch CPU pelo índice oficial:
 
-O tradutor usa serviço online via `deep-translator`. Se a rede falhar, o app mantém o texto original em vez de quebrar.
+```powershell
+python -m pip install torch==2.2.2 torchvision==0.17.2 torchaudio==2.2.2 --index-url https://download.pytorch.org/whl/cpu
+```
+
+### `paddlepaddle` não compatível com Python 3.14
+
+Use Python 3.10. O projeto foi pensado para Python 3.10 no Windows. Versões muito novas do Python podem não ter wheels compatíveis para `paddlepaddle`.
+
+### App escrevendo a tradução por cima do texto original
+
+Isso indica que a etapa de limpeza não conseguiu gerar uma máscara boa para remover o texto antigo. Verifique os arquivos de debug em `output/<job>/debug/`, especialmente:
+
+```text
+debug_dark_text_mask.png
+debug_ocr_mask.png
+debug_final_cleanup_mask.png
+debug_after_cleanup.png
+```
+
+Se a máscara final não cobre o texto antigo, ajuste as configurações de limpeza em `app/config.py` ou melhore a segmentação dos balões.
 
 ### Nenhum balão detectado
 
-O app não quebra. Ele salva a imagem original como resultado traduzido e mostra o aviso na interface. Confira se o modelo YOLO é adequado para balões de mangá.
+Possíveis causas:
 
-## Comandos de teste
+- O modelo `bubble_seg.pt` não foi treinado para esse estilo de mangá.
+- A imagem está em baixa resolução.
+- O balão tem formato incomum.
+- A confiança do YOLO está alta demais.
 
-Verificar sintaxe dos arquivos:
-
-```powershell
-python -m compileall app streamlit_app.py examples
-```
-
-Gerar imagem de exemplo:
+Confira o modelo e, se necessário, gere predições com:
 
 ```powershell
-python examples\create_sample.py
+python training/predict_debug.py --model models/bubble_seg.pt --source caminho\da\imagem.png
 ```
 
-Rodar o app:
+### Tradução falhando por internet
 
-```powershell
-python -m streamlit run streamlit_app.py
-```
+O `deep-translator` depende de acesso externo ao serviço de tradução. Se a rede falhar, o app tenta manter o texto original em vez de quebrar o fluxo.
+
+### OCR lento na primeira execução
+
+O PaddleOCR pode demorar na primeira execução por carregamento inicial dos modelos. Depois disso, a execução tende a ser mais rápida.
+
+## Limitações Atuais
+
+- Páginas reais de mangá variam muito em qualidade, resolução, contraste e estilo visual.
+- A qualidade da detecção depende diretamente do modelo `models/bubble_seg.pt`.
+- O OCR pode falhar em fontes muito estilizadas, texto inclinado, ruído ou baixa resolução.
+- A limpeza do texto original ainda pode falhar em alguns balões, especialmente quando há arte ou sombras dentro do balão.
+- A tradução automática pode não preservar contexto, tom, gênero ou estilo de fala com perfeição.
+- O app foi pensado para uso local e processamento de imagens individuais, não para produção em lote em larga escala.
+
+## Melhorias Futuras
+
+- Treinar um modelo próprio de segmentação com mais exemplos de mangá.
+- Melhorar o debug visual dos balões e máscaras dentro da interface.
+- Implementar técnicas de inpainting mais avançadas.
+- Suporte a mais idiomas de origem e destino.
+- Processamento em lote de várias páginas.
+- Melhor posicionamento de texto para balões inclinados ou muito irregulares.
+- Presets de limpeza para mangá preto e branco, webtoon colorido e scans antigos.
+
+## Licença
+
+Defina a licença desejada antes da publicação final.
+
