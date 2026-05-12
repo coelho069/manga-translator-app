@@ -1,0 +1,22 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from app.config import AppConfig
+from app.pipeline import MangaTranslatorPipeline
+from app.types import AppResult
+from app.utils import ensure_dir, make_job_dir, sanitize_filename
+
+
+def process_uploaded_image(filename, content, progress_callback=None) -> AppResult:
+    config = AppConfig()
+    ensure_dir(config.output_dir)
+    job_dir = make_job_dir(config.output_dir)
+
+    safe_name = sanitize_filename(filename)
+    input_path = Path(job_dir) / safe_name
+    input_path.write_bytes(content)
+
+    pipeline = MangaTranslatorPipeline(config=config)
+    return pipeline.run(input_path, output_dir=job_dir, progress_callback=progress_callback)
+

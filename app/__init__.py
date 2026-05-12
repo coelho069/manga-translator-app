@@ -1,0 +1,2 @@
+"""Manga Translator App package."""
+
