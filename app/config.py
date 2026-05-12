@@ -10,6 +10,7 @@ class AppConfig:
     target_lang: str = "pt"
     ocr_lang: str = "en"
     translation_style: str = "natural"
+    performance_mode: str = "balanced"
     yolo_confidence: float = 0.25
     yolo_iou: float = 0.45
     bubble_erode_px: int = 8
@@ -22,6 +23,9 @@ class AppConfig:
     min_bubble_area: int = 300
     min_bubble_width: int = 20
     min_bubble_height: int = 20
+    min_ocr_area: int = 900
+    min_ocr_width: int = 24
+    min_ocr_height: int = 18
     bubble_mask_close_px: int = 5
     bubble_mask_open_px: int = 3
     use_dark_text_fallback: bool = True
@@ -38,4 +42,5 @@ class AppConfig:
     draw_text_outline: bool = False
     text_color: tuple[int, int, int] = (0, 0, 0)
     outline_color: tuple[int, int, int] = (255, 255, 255)
+    debug_enabled: bool = False
     debug_dir: Path | None = None

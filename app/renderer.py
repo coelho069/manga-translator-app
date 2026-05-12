@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from functools import lru_cache
+
 import cv2
 import numpy as np
 from PIL import ImageDraw, ImageFont
@@ -127,9 +129,10 @@ class TextRenderer:
     def _fit_text(self, draw: ImageDraw.ImageDraw, text: str, max_width: int, max_height: int, bubble: SpeechBubble):
         step = max(1, self.config.font_shrink_step)
         effective_max_font = self._effective_max_font_size(bubble, max_width, max_height)
+        spacing_candidates = self._spacing_candidates()
         for size in range(effective_max_font, self.config.min_font_size - 1, -step):
             font = self._load_font(size)
-            for spacing_ratio in (self.config.line_spacing_ratio, 1.05, 1.0):
+            for spacing_ratio in spacing_candidates:
                 lines = self._wrap_text(draw, text, font, max_width)
                 if not lines:
                     continue
@@ -166,6 +169,7 @@ class TextRenderer:
         return max(self.config.min_font_size, min(self.config.max_font_size, cap))
 
     @staticmethod
+    @lru_cache(maxsize=64)
     def _load_font(size: int):
         for font_name in ("arial.ttf", "Arial.ttf", "DejaVuSans.ttf"):
             try:
@@ -173,6 +177,13 @@ class TextRenderer:
             except OSError:
                 continue
         return ImageFont.load_default()
+
+    def _spacing_candidates(self) -> tuple[float, ...]:
+        if self.config.performance_mode == "fast":
+            return (self.config.line_spacing_ratio,)
+        if self.config.performance_mode == "quality":
+            return (self.config.line_spacing_ratio, 1.08, 1.05, 1.0)
+        return (self.config.line_spacing_ratio, 1.0)
 
     def _wrap_text(self, draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> list[str]:
         words = safe_text(text).split()

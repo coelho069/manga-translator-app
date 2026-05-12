@@ -45,7 +45,17 @@ class BubbleCleaner:
         self.last_ocr_mask = ocr_mask.copy()
 
         final_mask = cv2.bitwise_or(dark_mask, ocr_mask)
+        if cv2.countNonZero(final_mask) == 0:
+            self._add_note(bubble, "nenhum pixel de texto encontrado; limpeza ignorada")
+            self.last_cleaned = False
+            return image
+
         final_mask = cv2.bitwise_and(final_mask, inner_mask)
+        if cv2.countNonZero(final_mask) == 0:
+            self._add_note(bubble, "mascara de texto fora do balao; limpeza ignorada")
+            self.last_cleaned = False
+            return image
+
         final_mask = self._dilate(final_mask, self.config.text_mask_dilate_px)
         final_mask = self._close(final_mask, self.config.cleanup_morph_close_px)
         final_mask = self._dilate(final_mask, self.config.cleanup_extra_dilate_px)

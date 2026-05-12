@@ -57,6 +57,29 @@ Damn it! -> Droga!
 
 A tradução continua sendo automática e pode falhar em frases ambíguas, piadas, nomes incomuns ou contexto visual que não esteja no texto OCR.
 
+## Performance
+
+O app possui três modos de performance:
+
+- **Equilibrado**: padrão recomendado, mantém boa qualidade com custo moderado.
+- **Rápido**: pula balões pequenos com mais agressividade, reduz morfologia e limita tentativas de renderização.
+- **Qualidade**: preserva ajustes mais cuidadosos e tende a processar mais balões, com maior custo.
+
+O pipeline registra tempos por etapa em `result.metadata["timings"]`, incluindo:
+
+```text
+load_image
+detect
+ocr
+translate
+clean
+render
+save
+total
+```
+
+Na interface, o resultado mostra o tempo total e permite abrir os tempos por etapa. O debug visual fica desligado por padrão para evitar escrita desnecessária de imagens em disco; habilite **Salvar debug visual** apenas quando estiver investigando problemas.
+
 ## Demonstração / Fluxo
 
 1. Instale as dependências do projeto.
@@ -200,13 +223,14 @@ http://localhost:8501
 1. Abra o app no navegador.
 2. Escolha o idioma de entrada: **Inglês** ou **Chinês**.
 3. Escolha o estilo de tradução: **Natural** ou **Literal**.
-4. Envie uma imagem PNG, JPG ou JPEG.
-5. Opcionalmente, marque **Usar imagem de exemplo** para testar com arquivos de `examples/bubbles/`.
-6. Clique em **Iniciar tradução**.
-7. Acompanhe a barra de progresso.
-8. Compare a imagem original e a imagem traduzida lado a lado.
-9. Baixe a imagem traduzida pelo botão da interface.
-10. Também é possível encontrar os resultados em `output/`.
+4. Escolha o modo de performance: **Equilibrado**, **Rápido** ou **Qualidade**.
+5. Envie uma imagem PNG, JPG ou JPEG.
+6. Opcionalmente, marque **Usar imagem de exemplo** para testar com arquivos de `examples/bubbles/`.
+7. Clique em **Iniciar tradução**.
+8. Acompanhe a barra de progresso.
+9. Compare a imagem original e a imagem traduzida lado a lado.
+10. Baixe a imagem traduzida pelo botão da interface.
+11. Também é possível encontrar os resultados em `output/`.
 
 ## Linha de Comando / Testes
 

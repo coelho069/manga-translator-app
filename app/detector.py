@@ -10,6 +10,8 @@ from app.types import BoundingBox, SpeechBubble
 
 
 class BubbleDetector:
+    _model_cache = {}
+
     def __init__(self, config: AppConfig):
         self.config = config
         self.model_path = Path(config.bubble_model_path)
@@ -21,7 +23,10 @@ class BubbleDetector:
 
         from ultralytics import YOLO
 
-        self.model = YOLO(str(self.model_path))
+        cache_key = (str(self.model_path.resolve()), bool(config.use_gpu))
+        if cache_key not in BubbleDetector._model_cache:
+            BubbleDetector._model_cache[cache_key] = YOLO(str(self.model_path))
+        self.model = BubbleDetector._model_cache[cache_key]
 
     def detect(self, image: np.ndarray) -> list[SpeechBubble]:
         if image is None or image.size == 0:
