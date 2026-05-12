@@ -12,7 +12,7 @@ from app.ocr import OCRReader
 from app.renderer import TextRenderer
 from app.translator import BaseTranslator, GoogleTextTranslator
 from app.types import AppResult, SpeechBubble
-from app.utils import ensure_dir, read_image_cv2, safe_text, write_image_cv2
+from app.utils import ensure_dir, read_image_cv2, resolve_ocr_lang, resolve_translation_lang, safe_text, write_image_cv2
 
 
 class MangaTranslatorPipeline:
@@ -54,10 +54,15 @@ class MangaTranslatorPipeline:
                 bubble.processing_notes.append("sem texto OCR; balao mantido intacto")
                 continue
 
-            self._progress(progress_callback, 0.45 + bubble_progress * 0.15, "traduzindo")
-            bubble.translated_text = safe_text(self.translator.translate(bubble.source_text))
-            if not bubble.translated_text:
-                bubble.processing_notes.append("sem traducao; balao mantido intacto")
+        translatable_bubbles = [bubble for bubble in bubbles if bubble.source_text]
+        page_texts = [bubble.source_text for bubble in translatable_bubbles]
+        if page_texts:
+            self._progress(progress_callback, 0.48, "traduzindo")
+            translations = self.translator.translate_batch(page_texts)
+            for bubble, translation in zip(translatable_bubbles, translations):
+                bubble.translated_text = safe_text(translation)
+                if not bubble.translated_text:
+                    bubble.processing_notes.append("sem traducao; balao mantido intacto")
 
         work_image = image.copy()
         cleaned_bubble_ids: set[int] = set()
@@ -104,6 +109,10 @@ class MangaTranslatorPipeline:
             output_dir=Path(output_dir),
             metadata={
                 "bubble_count": len(bubbles),
+                "source_lang": resolve_translation_lang(self.config.source_lang),
+                "ocr_lang": resolve_ocr_lang(self.config.ocr_lang or self.config.source_lang),
+                "target_lang": safe_text(self.config.target_lang) or "pt",
+                "translation_style": safe_text(self.config.translation_style) or "natural",
                 "cleaned_bubble_ids": sorted(cleaned_bubble_ids),
                 "skipped_bubbles": [
                     {"id": bubble.id, "notes": list(bubble.processing_notes)}

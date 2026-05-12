@@ -1,6 +1,6 @@
 # Manga Translator App
 
-Aplicativo local em Python com Streamlit para traduzir páginas de mangá em inglês para português.  
+Aplicativo local em Python com Streamlit para traduzir páginas de mangá em inglês ou chinês simplificado para português.  
 O app recebe uma imagem, detecta balões de fala com YOLO segmentation, lê o texto com PaddleOCR, traduz com `deep-translator`, tenta apagar o texto original e renderiza a tradução dentro dos balões.
 
 O processamento roda localmente no Windows e usa CPU por padrão.
@@ -10,8 +10,8 @@ O processamento roda localmente no Windows e usa CPU por padrão.
 - Upload de imagens PNG, JPG e JPEG.
 - Pré-visualização da imagem original.
 - Detecção de balões de fala com YOLO segmentation.
-- OCR em inglês com PaddleOCR.
-- Tradução automática de inglês para português com `deep-translator`.
+- OCR em inglês ou chinês simplificado com PaddleOCR.
+- Tradução automática para português com `deep-translator`.
 - Limpeza do texto original dentro dos balões.
 - Renderização da tradução centralizada no balão.
 - Comparação lado a lado entre imagem original e traduzida.
@@ -20,15 +20,53 @@ O processamento roda localmente no Windows e usa CPU por padrão.
 - Geração de imagens de exemplo para testes.
 - Estrutura opcional de dataset e scripts de treino para melhorar o modelo de balões.
 
+## Idiomas Suportados
+
+O app aceita dois idiomas de entrada nesta versão:
+
+| Entrada | OCR PaddleOCR | Tradução deep-translator | Saída |
+| --- | --- | --- | --- |
+| Inglês | `en` | `en -> pt` | Português |
+| Chinês simplificado | `ch` | `zh-CN -> pt` | Português |
+
+Na interface Streamlit, selecione **Idioma de entrada** antes de iniciar a tradução. Se um valor inválido for recebido internamente, o app usa inglês como fallback.
+
+## Qualidade da Tradução
+
+O app possui dois estilos de tradução:
+
+- **Natural**: prioriza português brasileiro mais natural, com pequenos ajustes para expressões comuns de mangá/comic.
+- **Literal**: usa uma tradução mais direta, com menos ajustes idiomáticos.
+
+No modo **Natural**, o tradutor aplica algumas melhorias antes e depois da tradução:
+
+- tradução em lote por página, mantendo a ordem dos balões;
+- cache para frases repetidas, ajudando na consistência;
+- glossário simples para preservar honoríficos como `senpai`, `sensei`, `kun`, `chan` e `san`;
+- proteção básica de possíveis nomes próprios antes de enviar o texto ao tradutor;
+- normalização de pontuação em português, preservando `!`, `?`, `...` e combinações emocionais.
+
+Exemplos de expressões tratadas com mais naturalidade:
+
+```text
+No way! -> Não pode ser!
+I got it! -> Entendi!
+Shut up! -> Cala a boca!
+Damn it! -> Droga!
+```
+
+A tradução continua sendo automática e pode falhar em frases ambíguas, piadas, nomes incomuns ou contexto visual que não esteja no texto OCR.
+
 ## Demonstração / Fluxo
 
 1. Instale as dependências do projeto.
 2. Coloque o modelo YOLO em `models/bubble_seg.pt`.
 3. Rode o aplicativo Streamlit.
-4. Envie uma página de mangá em inglês.
-5. Clique em **Iniciar tradução**.
-6. Aguarde as etapas de detecção, OCR, tradução, limpeza e renderização.
-7. Baixe a imagem traduzida ou acesse o resultado em `output/`.
+4. Escolha o idioma de entrada: inglês ou chinês.
+5. Envie uma página de mangá no idioma escolhido.
+6. Clique em **Iniciar tradução**.
+7. Aguarde as etapas de detecção, OCR, tradução, limpeza e renderização.
+8. Baixe a imagem traduzida ou acesse o resultado em `output/`.
 
 ## Estrutura do Projeto
 
@@ -160,13 +198,15 @@ http://localhost:8501
 ## Como Usar
 
 1. Abra o app no navegador.
-2. Envie uma imagem PNG, JPG ou JPEG.
-3. Opcionalmente, marque **Usar imagem de exemplo** para testar com arquivos de `examples/bubbles/`.
-4. Clique em **Iniciar tradução**.
-5. Acompanhe a barra de progresso.
-6. Compare a imagem original e a imagem traduzida lado a lado.
-7. Baixe a imagem traduzida pelo botão da interface.
-8. Também é possível encontrar os resultados em `output/`.
+2. Escolha o idioma de entrada: **Inglês** ou **Chinês**.
+3. Escolha o estilo de tradução: **Natural** ou **Literal**.
+4. Envie uma imagem PNG, JPG ou JPEG.
+5. Opcionalmente, marque **Usar imagem de exemplo** para testar com arquivos de `examples/bubbles/`.
+6. Clique em **Iniciar tradução**.
+7. Acompanhe a barra de progresso.
+8. Compare a imagem original e a imagem traduzida lado a lado.
+9. Baixe a imagem traduzida pelo botão da interface.
+10. Também é possível encontrar os resultados em `output/`.
 
 ## Linha de Comando / Testes
 
@@ -332,7 +372,7 @@ O PaddleOCR pode demorar na primeira execução por carregamento inicial dos mod
 - A qualidade da detecção depende diretamente do modelo `models/bubble_seg.pt`.
 - O OCR pode falhar em fontes muito estilizadas, texto inclinado, ruído ou baixa resolução.
 - A limpeza do texto original ainda pode falhar em alguns balões, especialmente quando há arte ou sombras dentro do balão.
-- A tradução automática pode não preservar contexto, tom, gênero ou estilo de fala com perfeição.
+- A tradução automática pode não preservar contexto, tom, gênero ou estilo de fala com perfeição, mesmo com o modo Natural.
 - O app foi pensado para uso local e processamento de imagens individuais, não para produção em lote em larga escala.
 
 ## Melhorias Futuras
@@ -348,4 +388,3 @@ O PaddleOCR pode demorar na primeira execução por carregamento inicial dos mod
 ## Licença
 
 Defina a licença desejada antes da publicação final.
-

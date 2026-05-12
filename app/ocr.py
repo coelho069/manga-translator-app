@@ -6,28 +6,30 @@ import numpy as np
 
 from app.config import AppConfig
 from app.types import OCRTextBox
-from app.utils import safe_text
+from app.utils import resolve_ocr_lang, safe_text
 
 
 class OCRReader:
-    _reader = None
+    _readers = {}
     _lock = threading.Lock()
 
     def __init__(self, config: AppConfig):
         self.config = config
+        self.ocr_lang = resolve_ocr_lang(config.ocr_lang or config.source_lang)
 
     def _get_reader(self):
+        key = (self.ocr_lang, bool(self.config.use_gpu))
         with self._lock:
-            if OCRReader._reader is None:
+            if key not in OCRReader._readers:
                 from paddleocr import PaddleOCR
 
-                OCRReader._reader = PaddleOCR(
+                OCRReader._readers[key] = PaddleOCR(
                     use_angle_cls=True,
-                    lang="en",
+                    lang=self.ocr_lang,
                     use_gpu=self.config.use_gpu,
                     show_log=False,
                 )
-            return OCRReader._reader
+            return OCRReader._readers[key]
 
     def read(self, crop: np.ndarray, offset_x: int = 0, offset_y: int = 0) -> list[OCRTextBox]:
         if crop is None or crop.size == 0:
@@ -70,4 +72,3 @@ class OCRReader:
             return OCRTextBox(text=text, confidence=confidence, polygon=polygon)
         except (TypeError, ValueError, IndexError):
             return None
-

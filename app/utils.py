@@ -48,6 +48,41 @@ def safe_text(value) -> str:
     return " ".join(str(value).split()).strip()
 
 
+def normalize_source_lang(value) -> str:
+    lang = safe_text(value).lower()
+    lang = lang.replace("_", "-")
+    aliases = {
+        "en": "en",
+        "eng": "en",
+        "english": "en",
+        "ingles": "en",
+        "inglês": "en",
+        "zh": "zh-CN",
+        "zh-cn": "zh-CN",
+        "zh-hans": "zh-CN",
+        "cn": "zh-CN",
+        "ch": "zh-CN",
+        "chi": "zh-CN",
+        "chinese": "zh-CN",
+        "chines": "zh-CN",
+        "chinês": "zh-CN",
+        "chines simplificado": "zh-CN",
+        "chinês simplificado": "zh-CN",
+    }
+    return aliases.get(lang, "en")
+
+
+def resolve_ocr_lang(value) -> str:
+    normalized = normalize_source_lang(value)
+    if normalized == "zh-CN":
+        return "ch"
+    return "en"
+
+
+def resolve_translation_lang(value) -> str:
+    return normalize_source_lang(value)
+
+
 def sanitize_filename(filename: str) -> str:
     name = Path(safe_text(filename) or "image").name
     stem = Path(name).stem or "image"
@@ -62,4 +97,3 @@ def make_job_dir(base_dir: Path | str) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     job_id = uuid.uuid4().hex[:8]
     return ensure_dir(Path(base_dir) / f"job_{timestamp}_{job_id}")
-

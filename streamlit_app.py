@@ -16,9 +16,14 @@ st.set_page_config(page_title="Manga Translator App", page_icon="M", layout="wid
 
 st.title("Manga Translator App")
 st.write(
-    "Envie uma pagina de manga em ingles para detectar baloes, ler o texto, traduzir para portugues "
+    "Envie uma pagina de manga em ingles ou chines para detectar baloes, ler o texto, traduzir para portugues "
     "e gerar uma nova imagem com a traducao aplicada."
 )
+
+source_lang_label = st.selectbox("Idioma de entrada", ["Inglês", "Chinês"])
+source_lang = "zh-CN" if source_lang_label == "Chinês" else "en"
+translation_style_label = st.selectbox("Estilo de traducao", ["Natural", "Literal"])
+translation_style = "literal" if translation_style_label == "Literal" else "natural"
 
 uploaded_file = st.file_uploader("Imagem PNG, JPG ou JPEG", type=["png", "jpg", "jpeg"])
 
@@ -58,7 +63,13 @@ if content is not None and filename is not None:
             status.write(message)
 
         try:
-            result = process_uploaded_image(filename, content, progress_callback=update_progress)
+            result = process_uploaded_image(
+                filename,
+                content,
+                source_lang=source_lang,
+                translation_style=translation_style,
+                progress_callback=update_progress,
+            )
             progress_bar.progress(100)
             status.success("Traducao finalizada.")
 
@@ -83,7 +94,7 @@ if content is not None and filename is not None:
                 for bubble in result.bubbles:
                     with st.container(border=True):
                         st.markdown(f"**Balao {bubble.id}**")
-                        st.write("**Original em ingles:**", bubble.source_text or "(sem texto detectado)")
+                        st.write(f"**Original ({source_lang_label}):**", bubble.source_text or "(sem texto detectado)")
                         st.write("**Traducao em portugues:**", bubble.translated_text or "(sem traducao)")
             else:
                 st.info("Nenhum balao foi detectado na imagem.")
