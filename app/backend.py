@@ -49,24 +49,33 @@ def _build_config(source_lang: str, ocr_lang: str, translation_style: str, perfo
     if performance_mode == "fast":
         base.update(
             {
+                "yolo_imgsz": 640,
+                "yolo_confidence": 0.24,
                 "min_ocr_area": 1600,
                 "min_ocr_width": 32,
                 "min_ocr_height": 24,
+                "min_ocr_dark_ratio": 0.002,
                 "bubble_mask_close_px": 3,
                 "bubble_mask_open_px": 1,
+                "bubble_erode_px": 6,
                 "text_mask_dilate_px": 7,
                 "cleanup_morph_close_px": 3,
                 "cleanup_extra_dilate_px": 1,
                 "render_margin_px": 10,
                 "max_font_size": 24,
+                "font_shrink_step": 2,
+                "max_render_font_attempts": 10,
             }
         )
     elif performance_mode == "quality":
         base.update(
             {
+                "yolo_imgsz": 1280,
+                "yolo_confidence": 0.18,
                 "min_ocr_area": 500,
                 "min_ocr_width": 18,
                 "min_ocr_height": 14,
+                "min_ocr_dark_ratio": 0.0005,
                 "bubble_mask_close_px": 6,
                 "bubble_mask_open_px": 3,
                 "text_mask_dilate_px": 12,
@@ -74,6 +83,7 @@ def _build_config(source_lang: str, ocr_lang: str, translation_style: str, perfo
                 "cleanup_extra_dilate_px": 3,
                 "render_margin_px": 14,
                 "max_font_size": 32,
+                "max_render_font_attempts": 40,
             }
         )
     return AppConfig(**base)

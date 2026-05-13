@@ -1,8 +1,13 @@
 .venv/
 __pycache__/
+*.pyc
 *.py[cod]
-output/
+output/*
+!output/.gitkeep
 models/*.pt
+runs/
+*.log
+*.tmp
 .pytest_cache/
 .streamlit/secrets.toml
-
+manga109-segmentation-bubble/

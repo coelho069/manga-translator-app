@@ -18,7 +18,6 @@ O processamento roda localmente no Windows e usa CPU por padrão.
 - Botão para baixar a imagem traduzida.
 - Execução local no navegador com Streamlit.
 - Geração de imagens de exemplo para testes.
-- Estrutura opcional de dataset e scripts de treino para melhorar o modelo de balões.
 
 ## Idiomas Suportados
 
@@ -106,18 +105,12 @@ manga-translator-app/
     renderer.py
     pipeline.py
     backend.py
-  dataset/
-    bubbles/
   examples/
     bubbles/
     create_bubble_examples.py
-    create_sample.py
   models/
     bubble_seg.pt
   output/
-  training/
-    train_bubble_model.py
-    predict_debug.py
   streamlit_app.py
   requirements.txt
   setup.ps1
@@ -127,8 +120,8 @@ manga-translator-app/
 ### Arquivos principais
 
 - `app/detector.py`: carrega o modelo YOLO segmentation e detecta os balões de fala.
-- `app/ocr.py`: executa OCR em inglês com PaddleOCR e retorna textos/polígonos detectados.
-- `app/translator.py`: traduz o texto de inglês para português usando `deep-translator`.
+- `app/ocr.py`: executa OCR no idioma selecionado com PaddleOCR e retorna textos/polígonos detectados.
+- `app/translator.py`: traduz o texto do idioma de entrada para português usando `deep-translator`.
 - `app/cleaner.py`: tenta remover o texto original dentro dos balões, preservando a borda.
 - `app/renderer.py`: quebra linhas, ajusta fonte e desenha a tradução dentro do balão.
 - `app/pipeline.py`: coordena o fluxo completo de detecção, OCR, tradução, limpeza e renderização.
@@ -165,13 +158,25 @@ Na pasta raiz do projeto:
 py -3.10 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip setuptools wheel
-python -m pip install torch==2.2.2 torchvision==0.17.2 torchaudio==2.2.2 --index-url https://download.pytorch.org/whl/cpu
+python -m pip install torch==2.2.2 torchvision==0.17.2 --index-url https://download.pytorch.org/whl/cpu
 python -m pip install -r requirements.txt
 ```
 
 ## Modelo YOLO
 
 O aplicativo precisa de um modelo YOLO segmentation neste caminho:
+
+```text
+models/bubble_seg.pt
+```
+
+Por padrão, se esse arquivo não existir, o detector baixa automaticamente o modelo do Hugging Face:
+
+```text
+kitsumed/yolov8m_seg-speech-bubble
+```
+
+O arquivo baixado do repositório é `model.pt`, salvo localmente como:
 
 ```text
 models/bubble_seg.pt
@@ -195,6 +200,14 @@ O resultado esperado deve conter algo como:
 
 ```python
 {0: 'speech bubble'}
+```
+
+Durante a detecção, o app também salva arquivos de debug rápidos em `output/`:
+
+```text
+output/debug_detection.png
+output/debug_masks.png
+output/debug_boxes.json
 ```
 
 ## Como Executar
@@ -234,12 +247,6 @@ http://localhost:8501
 
 ## Linha de Comando / Testes
 
-Gerar uma página simples de teste:
-
-```powershell
-python examples\create_sample.py
-```
-
 Gerar exemplos variados de balões:
 
 ```powershell
@@ -258,77 +265,15 @@ Rodar o app:
 python -m streamlit run streamlit_app.py
 ```
 
-## Melhorando a Detecção dos Balões
+## Modelo Personalizado
 
-A pasta `dataset/bubbles/` foi criada para organizar imagens anotadas e treinar ou fine-tunar um modelo YOLO segmentation melhor para balões de fala de mangá.
-
-Importante: colocar imagens na pasta não melhora automaticamente o app. É preciso anotar os balões, treinar o modelo e depois substituir o peso usado pelo aplicativo.
-
-Estrutura do dataset:
-
-```text
-dataset/bubbles/
-  images/
-    train/
-    val/
-  labels/
-    train/
-    val/
-  data.yaml
-```
-
-Cada imagem precisa ter um `.txt` com o mesmo nome na pasta de labels correspondente.
-
-Exemplo:
-
-```text
-dataset/bubbles/images/train/page_001.png
-dataset/bubbles/labels/train/page_001.txt
-```
-
-As labels devem estar no formato YOLO segmentation, com polígonos, não apenas bounding boxes.
-
-Classe única:
-
-```text
-0 = speech bubble
-```
-
-Treinar em CPU:
-
-```powershell
-python training/train_bubble_model.py --epochs 50 --imgsz 640 --batch 4 --device cpu
-```
-
-Treino em CPU pode ser lento. Com GPU compatível, é possível usar:
-
-```powershell
-python training/train_bubble_model.py --epochs 50 --imgsz 640 --batch 4 --device 0
-```
-
-Depois do treino, o melhor modelo geralmente fica em:
-
-```text
-runs/segment/train/weights/best.pt
-```
-
-Para usar o novo modelo no app, copie esse arquivo para:
+Para melhorar a detecção dos balões, use ou treine um modelo YOLO segmentation compatível em um fluxo separado e depois substitua o peso usado pelo aplicativo:
 
 ```text
 models/bubble_seg.pt
 ```
 
-Gerar predições de debug:
-
-```powershell
-python training/predict_debug.py --model models/bubble_seg.pt --source dataset/bubbles/images/val
-```
-
-As imagens de debug serão salvas em:
-
-```text
-output/debug_predictions/
-```
+Este repositório mantém apenas a estrutura necessária para executar o app local. Datasets, scripts de treino e resultados de treino não fazem parte do fluxo principal e devem ficar fora do repositório runtime.
 
 ## Problemas Comuns
 
@@ -347,7 +292,7 @@ Sem esse arquivo, o detector YOLO não consegue iniciar.
 Esse erro costuma estar relacionado à instalação do PyTorch ou a conflitos no ambiente Python. Tente recriar a `.venv` e instalar o PyTorch CPU pelo índice oficial:
 
 ```powershell
-python -m pip install torch==2.2.2 torchvision==0.17.2 torchaudio==2.2.2 --index-url https://download.pytorch.org/whl/cpu
+python -m pip install torch==2.2.2 torchvision==0.17.2 --index-url https://download.pytorch.org/whl/cpu
 ```
 
 ### `paddlepaddle` não compatível com Python 3.14
@@ -376,10 +321,10 @@ Possíveis causas:
 - O balão tem formato incomum.
 - A confiança do YOLO está alta demais.
 
-Confira o modelo e, se necessário, gere predições com:
+Confira se o modelo carregou corretamente e veja os arquivos de debug gerados em `output/`:
 
 ```powershell
-python training/predict_debug.py --model models/bubble_seg.pt --source caminho\da\imagem.png
+python -c "from ultralytics import YOLO; m=YOLO('models/bubble_seg.pt'); print(m.names)"
 ```
 
 ### Tradução falhando por internet

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import threading
 from functools import lru_cache
 
 from app.config import AppConfig
@@ -86,6 +87,9 @@ class IdentityTranslator(BaseTranslator):
 
 
 class GoogleTextTranslator(BaseTranslator):
+    _client_cache = {}
+    _client_lock = threading.Lock()
+
     def __init__(self, config: AppConfig):
         self.config = config
         self.source_lang = resolve_translation_lang(config.source_lang)
@@ -105,18 +109,19 @@ class GoogleTextTranslator(BaseTranslator):
 
     def translate_batch(self, texts: list[str]) -> list[str]:
         clean_texts = [safe_text(text) for text in texts]
-        translations: list[str] = []
+        unique_to_translate: list[str] = []
+        seen = set()
         for text in clean_texts:
-            if not text:
-                translations.append("")
+            if not text or text in self._page_memory or text in seen:
                 continue
-            if text in self._page_memory:
-                translations.append(self._page_memory[text])
-                continue
+            seen.add(text)
+            unique_to_translate.append(text)
+
+        for text in unique_to_translate:
             translated = self._translate_one(text)
             self._page_memory[text] = translated
-            translations.append(translated)
-        return translations
+
+        return [self._page_memory.get(text, "") if text else "" for text in clean_texts]
 
     def _translate_one(self, text: str) -> str:
         original = safe_text(text)
@@ -181,12 +186,21 @@ class GoogleTextTranslator(BaseTranslator):
     @lru_cache(maxsize=1024)
     def _translate_cached(text: str, source_lang: str, target_lang: str) -> str:
         try:
-            from deep_translator import GoogleTranslator
-
-            translated = GoogleTranslator(source=source_lang, target=target_lang).translate(text)
+            translator = GoogleTextTranslator._get_client(source_lang, target_lang)
+            translated = translator.translate(text)
             return safe_text(translated) or text
         except Exception:
             return text
+
+    @classmethod
+    def _get_client(cls, source_lang: str, target_lang: str):
+        key = (source_lang, target_lang)
+        with cls._client_lock:
+            if key not in cls._client_cache:
+                from deep_translator import GoogleTranslator
+
+                cls._client_cache[key] = GoogleTranslator(source=source_lang, target=target_lang)
+            return cls._client_cache[key]
 
 
 def detect_proper_names(text: str) -> list[str]:

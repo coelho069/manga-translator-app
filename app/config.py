@@ -5,14 +5,18 @@ from pathlib import Path
 @dataclass(frozen=True)
 class AppConfig:
     bubble_model_path: Path = Path("models/bubble_seg.pt")
+    hf_bubble_model_repo: str = "kitsumed/yolov8m_seg-speech-bubble"
+    hf_bubble_model_filename: str = "model.pt"
+    auto_download_bubble_model: bool = True
     output_dir: Path = Path("output")
     source_lang: str = "en"
     target_lang: str = "pt"
     ocr_lang: str = "en"
     translation_style: str = "natural"
     performance_mode: str = "balanced"
-    yolo_confidence: float = 0.25
-    yolo_iou: float = 0.45
+    yolo_confidence: float = 0.20
+    yolo_iou: float = 0.50
+    yolo_imgsz: int = 960
     bubble_erode_px: int = 8
     text_mask_dilate_px: int = 11
     render_margin_px: int = 14
@@ -26,6 +30,8 @@ class AppConfig:
     min_ocr_area: int = 900
     min_ocr_width: int = 24
     min_ocr_height: int = 18
+    min_ocr_dark_ratio: float = 0.001
+    ocr_cache_max_items: int = 256
     bubble_mask_close_px: int = 5
     bubble_mask_open_px: int = 3
     use_dark_text_fallback: bool = True
@@ -38,6 +44,7 @@ class AppConfig:
     cleaner_mode: str = "white_fill"
     line_spacing_ratio: float = 1.05
     font_shrink_step: int = 1
+    max_render_font_attempts: int = 28
     text_padding_px: int = 6
     draw_text_outline: bool = False
     text_color: tuple[int, int, int] = (0, 0, 0)

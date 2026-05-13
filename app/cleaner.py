@@ -56,9 +56,9 @@ class BubbleCleaner:
             self.last_cleaned = False
             return image
 
-        final_mask = self._dilate(final_mask, self.config.text_mask_dilate_px)
-        final_mask = self._close(final_mask, self.config.cleanup_morph_close_px)
-        final_mask = self._dilate(final_mask, self.config.cleanup_extra_dilate_px)
+        final_mask = self._dilate(final_mask, self._mode_radius(self.config.text_mask_dilate_px))
+        final_mask = self._close(final_mask, self._mode_radius(self.config.cleanup_morph_close_px))
+        final_mask = self._dilate(final_mask, self._mode_radius(self.config.cleanup_extra_dilate_px))
         final_mask = cv2.bitwise_and(final_mask, inner_mask)
 
         final_mask = self._filter_if_too_large(final_mask, inner_mask, bubble)
@@ -143,15 +143,29 @@ class BubbleCleaner:
         inner_mask: np.ndarray,
         bubble: SpeechBubble,
     ) -> np.ndarray:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        coords = cv2.findNonZero(inner_mask)
+        if coords is None:
+            return np.zeros(inner_mask.shape, dtype=np.uint8)
 
+        x, y, w, h = cv2.boundingRect(coords)
+        image_crop = image[y : y + h, x : x + w]
+        inner_crop = inner_mask[y : y + h, x : x + w]
+        if image_crop.size == 0 or inner_crop.size == 0:
+            return np.zeros(inner_mask.shape, dtype=np.uint8)
+
+        gray = cv2.cvtColor(image_crop, cv2.COLOR_BGR2GRAY)
         raw = np.zeros_like(gray, dtype=np.uint8)
         raw[gray < self.config.dark_text_threshold] = 255
-        raw = cv2.bitwise_and(raw, inner_mask)
+        raw = cv2.bitwise_and(raw, inner_crop)
 
-        filtered = self._filter_text_components(raw, inner_mask, bubble)
-        filtered = self._close(filtered, self.config.cleanup_morph_close_px)
+        if cv2.countNonZero(raw) == 0:
+            return np.zeros(inner_mask.shape, dtype=np.uint8)
 
+        filtered_crop = self._filter_text_components(raw, inner_crop, bubble)
+        filtered_crop = self._close(filtered_crop, self._mode_radius(self.config.cleanup_morph_close_px))
+
+        filtered = np.zeros(inner_mask.shape, dtype=np.uint8)
+        filtered[y : y + h, x : x + w] = filtered_crop
         return filtered
 
     def _ocr_text_mask(self, bubble: SpeechBubble, shape: tuple[int, int]) -> np.ndarray:
@@ -171,8 +185,8 @@ class BubbleCleaner:
         if cv2.countNonZero(mask) == 0:
             return mask
 
-        mask = self._dilate(mask, max(1, self.config.text_mask_dilate_px // 2))
-        mask = self._close(mask, self.config.cleanup_morph_close_px)
+        mask = self._dilate(mask, max(1, self._mode_radius(self.config.text_mask_dilate_px) // 2))
+        mask = self._close(mask, self._mode_radius(self.config.cleanup_morph_close_px))
 
         return mask
 
@@ -251,7 +265,7 @@ class BubbleCleaner:
             return final_mask
 
         filtered = self._filter_text_components(final_mask, inner_mask, bubble)
-        filtered = self._close(filtered, self.config.cleanup_morph_close_px)
+        filtered = self._close(filtered, self._mode_radius(self.config.cleanup_morph_close_px))
         filtered = cv2.bitwise_and(filtered, inner_mask)
 
         filtered_pixels = cv2.countNonZero(filtered)
@@ -270,17 +284,31 @@ class BubbleCleaner:
     ) -> np.ndarray:
         result = image.copy()
 
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        light_pixels = (inner_mask > 0) & (gray > 200)
+        coords = cv2.findNonZero(inner_mask)
+        if coords is None:
+            result[final_mask > 0] = (255, 255, 255)
+            return result
+
+        x, y, w, h = cv2.boundingRect(coords)
+        image_crop = image[y : y + h, x : x + w]
+        inner_crop = inner_mask[y : y + h, x : x + w]
+        gray = cv2.cvtColor(image_crop, cv2.COLOR_BGR2GRAY)
+        light_pixels = (inner_crop > 0) & (gray > 200)
 
         if np.any(light_pixels):
-            mean_color = image[light_pixels].mean(axis=0)
+            mean_color = image_crop[light_pixels].mean(axis=0)
             fill_color = tuple(int(v) for v in mean_color)
         else:
             fill_color = (255, 255, 255)
 
         result[final_mask > 0] = fill_color
         return result
+
+    def _mode_radius(self, radius: int) -> int:
+        radius = max(0, int(radius))
+        if self.config.performance_mode == "fast":
+            return max(0, radius // 2)
+        return radius
 
     @staticmethod
     def _kernel(radius: int) -> np.ndarray:

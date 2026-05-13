@@ -19,9 +19,6 @@ class TextRenderer:
         text = safe_text(bubble.translated_text)
         if not text:
             return image
-        if bubble.source_text and bubble.translated_text and not bubble.cleanup_success:
-            bubble.processing_notes.append("limpeza nao confirmada; texto nao renderizado")
-            return image
 
         rect = self.get_safe_text_rect(bubble, image.shape)
         if rect is None:
@@ -130,12 +127,17 @@ class TextRenderer:
         step = max(1, self.config.font_shrink_step)
         effective_max_font = self._effective_max_font_size(bubble, max_width, max_height)
         spacing_candidates = self._spacing_candidates()
+        attempts = 0
+        max_attempts = max(0, int(self.config.max_render_font_attempts))
         for size in range(effective_max_font, self.config.min_font_size - 1, -step):
+            attempts += 1
+            if max_attempts and attempts > max_attempts:
+                break
             font = self._load_font(size)
+            lines = self._wrap_text(draw, text, font, max_width)
+            if not lines:
+                continue
             for spacing_ratio in spacing_candidates:
-                lines = self._wrap_text(draw, text, font, max_width)
-                if not lines:
-                    continue
                 line_height = self._line_height(draw, font, spacing_ratio)
                 total_height = line_height * len(lines)
                 widest = max(self._text_width(draw, line, font) for line in lines)
