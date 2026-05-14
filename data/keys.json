@@ -7,7 +7,10 @@
       "active": true,
       "redeemed": true,
       "redeemed_at": "2026-05-14T10:41:56",
-      "redeemed_ip": "local"
+      "redeemed_ip": "local",
+      "redeemed_ips": [
+        "local"
+      ]
     },
     {
       "key": "MANGA-L3N4-AQRX-US73",
@@ -16,7 +19,10 @@
       "active": true,
       "redeemed": true,
       "redeemed_at": "2026-05-14T10:42:15",
-      "redeemed_ip": "local"
+      "redeemed_ip": "local",
+      "redeemed_ips": [
+        "local"
+      ]
     }
   ]
 }
