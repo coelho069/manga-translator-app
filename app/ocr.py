@@ -19,19 +19,15 @@ class OCRReader:
     def __init__(self, config: AppConfig):
         self.config = config
         self.ocr_lang = resolve_ocr_lang(config.ocr_lang or config.source_lang)
+        print(f"[OCR] idioma: {self.ocr_lang}")
 
     def _get_reader(self):
-        key = (self.ocr_lang, bool(self.config.use_gpu))
+        key = (self.ocr_lang,)
         with self._lock:
             if key not in OCRReader._readers:
                 from paddleocr import PaddleOCR
 
-                OCRReader._readers[key] = PaddleOCR(
-                    use_angle_cls=True,
-                    lang=self.ocr_lang,
-                    use_gpu=self.config.use_gpu,
-                    show_log=False,
-                )
+                OCRReader._readers[key] = PaddleOCR(lang=self.ocr_lang)
             return OCRReader._readers[key]
 
     def read(self, crop: np.ndarray, offset_x: int = 0, offset_y: int = 0) -> list[OCRTextBox]:
@@ -44,7 +40,7 @@ class OCRReader:
             return self._offset_boxes(cached, offset_x, offset_y)
 
         reader = self._get_reader()
-        raw_result = reader.ocr(crop, cls=True)
+        raw_result = reader.ocr(crop)
         if not raw_result:
             self._store_cached(cache_key, [])
             return []

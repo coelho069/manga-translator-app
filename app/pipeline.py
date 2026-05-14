@@ -14,7 +14,7 @@ from app.ocr import OCRReader
 from app.renderer import TextRenderer
 from app.translator import BaseTranslator, GoogleTextTranslator
 from app.types import AppResult, SpeechBubble
-from app.utils import ensure_dir, read_image_cv2, resolve_ocr_lang, resolve_translation_lang, safe_text, write_image_cv2
+from app.utils import ensure_dir, read_image_cv2, safe_text, write_image_cv2
 
 
 class MangaTranslatorPipeline:
@@ -49,12 +49,18 @@ class MangaTranslatorPipeline:
         total_start = perf_counter()
         timings: dict[str, float] = {}
         output_dir = ensure_dir(output_dir or self.config.output_dir)
+
         self.debug_dir = None
         if self.config.debug_enabled or self.config.debug_dir is not None:
             self.debug_dir = ensure_dir(self.config.debug_dir or Path(output_dir) / "debug")
+
         flow_report_path: Path | None = None
         if self.debug_dir is not None:
             flow_report_path = Path(self.debug_dir) / "bubble_flow_report.json"
+
+        print(f"[MODO] {safe_text(self.config.translation_mode) or 'en_to_pt'}")
+        print(f"[OCR] {safe_text(self.config.ocr_lang) or 'en'}")
+        print(f"[TRADUCAO] {safe_text(self.config.source_lang) or 'en'} -> {safe_text(self.config.target_lang) or 'pt'}")
 
         self._progress(progress_callback, 0.05, "carregando imagem")
         step_start = perf_counter()
@@ -69,23 +75,31 @@ class MangaTranslatorPipeline:
 
         total = max(1, len(bubbles))
         flow_report = {bubble.id: self._new_flow_record(bubble) for bubble in bubbles}
+
         step_start = perf_counter()
         for index, bubble in enumerate(bubbles):
             bubble_progress = index / total
             self._progress(progress_callback, 0.25 + bubble_progress * 0.20, "lendo texto")
             record = flow_report[bubble.id]
             record["ocr_ran"] = True
+
             try:
                 raw_crop = self._masked_crop_for_ocr(image, bubble)
                 if raw_crop is None or raw_crop.size == 0:
                     record["skipped_reason"] = "crop vazio para OCR"
                     bubble.processing_notes.append("crop vazio para OCR")
                     continue
+
                 crop, scale = self._resize_crop_for_ocr(raw_crop)
                 bubble.ocr_boxes = self.ocr.read(crop, offset_x=bubble.bbox.x1, offset_y=bubble.bbox.y1)
                 if scale != 1.0:
                     self._rescale_ocr_boxes(bubble, scale)
-                bubble.source_text = safe_text(" ".join(safe_text(box.text) for box in bubble.ocr_boxes))
+
+                ocr_texts = [safe_text(box.text) for box in bubble.ocr_boxes if safe_text(box.text)]
+                if safe_text(self.config.source_lang).lower() == "ja":
+                    bubble.source_text = safe_text("".join(ocr_texts))
+                else:
+                    bubble.source_text = safe_text(" ".join(ocr_texts))
             except Exception as exc:
                 record["skipped_reason"] = f"erro no OCR: {exc}"
                 bubble.processing_notes.append(f"erro no OCR: {exc}")
@@ -100,6 +114,7 @@ class MangaTranslatorPipeline:
 
         translatable_bubbles = [bubble for bubble in bubbles if bubble.source_text]
         page_texts = [bubble.source_text for bubble in translatable_bubbles]
+
         step_start = perf_counter()
         if page_texts:
             self._progress(progress_callback, 0.48, "traduzindo")
@@ -109,17 +124,19 @@ class MangaTranslatorPipeline:
                 translations = page_texts
                 for bubble in translatable_bubbles:
                     bubble.processing_notes.append(f"erro em translate_batch; fallback aplicado: {exc}")
+
             if len(translations) != len(translatable_bubbles):
                 translations = [
                     safe_text(translations[idx]) if idx < len(translations) else bubble.source_text
                     for idx, bubble in enumerate(translatable_bubbles)
                 ]
+
             for bubble, translation in zip(translatable_bubbles, translations):
                 record = flow_report[bubble.id]
                 record["translation_ran"] = True
                 bubble.translated_text = safe_text(translation) or bubble.source_text
                 record["translated_text"] = bubble.translated_text
-                print(f"[TRADUÇÃO] Bubble {bubble.id}: {bubble.source_text} -> {bubble.translated_text}")
+                print(f"[TRADUCAO] Bubble {bubble.id}: {bubble.source_text} -> {bubble.translated_text}")
                 if not bubble.translated_text:
                     record["skipped_reason"] = "traducao vazia"
                     bubble.processing_notes.append("sem traducao; balao mantido intacto")
@@ -127,45 +144,63 @@ class MangaTranslatorPipeline:
 
         work_image = image.copy()
         cleaned_bubble_ids: set[int] = set()
+        clean_elapsed = 0.0
+        render_elapsed = 0.0
 
-        step_start = perf_counter()
         for index, bubble in enumerate(bubbles):
+            if not (bubble.source_text and bubble.translated_text):
+                continue
+
             bubble_progress = index / total
-            if bubble.source_text and bubble.translated_text:
-                self._progress(progress_callback, 0.62 + bubble_progress * 0.16, "apagando texto original")
-                record = flow_report[bubble.id]
-                record["cleanup_ran"] = True
-                bubble.cleanup_success = False
+            record = flow_report[bubble.id]
+            record["cleanup_ran"] = True
+            bubble.cleanup_success = False
+
+            self._progress(progress_callback, 0.62 + bubble_progress * 0.16, "apagando texto original")
+            clean_start = perf_counter()
+            try:
+                work_image = self.cleaner.clean(work_image, bubble)
+            except Exception as exc:
+                bubble.processing_notes.append(f"erro na limpeza: {exc}")
+                record["skipped_reason"] = f"erro na limpeza: {exc}"
+            clean_elapsed += self._elapsed(clean_start)
+
+            if not self.cleaner.last_cleaned and bool(getattr(self.config, "force_clean_on_failed_mask", True)):
+                fallback_start = perf_counter()
                 try:
-                    work_image = self.cleaner.clean(work_image, bubble)
-                    self._save_bubble_debug(bubble)
+                    work_image = self.cleaner.force_clean_bubble_inner_area(work_image, bubble)
                 except Exception as exc:
-                    bubble.processing_notes.append(f"erro na limpeza: {exc}")
-                    record["skipped_reason"] = f"erro na limpeza: {exc}"
+                    bubble.processing_notes.append(f"erro no fallback de limpeza: {exc}")
+                    if not record["skipped_reason"]:
+                        record["skipped_reason"] = f"erro no fallback de limpeza: {exc}"
+                clean_elapsed += self._elapsed(fallback_start)
 
-                if self.cleaner.last_cleaned:
-                    bubble.cleanup_success = True
-                    cleaned_bubble_ids.add(bubble.id)
-                else:
-                    bubble.processing_notes.append("limpeza falhou; renderizacao em fallback permitida")
-        timings["clean"] = self._elapsed(step_start)
+            self._save_bubble_debug(bubble)
 
+            if self.cleaner.last_cleaned:
+                bubble.cleanup_success = True
+                cleaned_bubble_ids.add(bubble.id)
+            else:
+                bubble.processing_notes.append("limpeza falhou; renderizacao ignorada para evitar sobreposicao")
+                if not record["skipped_reason"]:
+                    record["skipped_reason"] = "limpeza falhou"
+                continue
+
+            self._progress(progress_callback, 0.80 + bubble_progress * 0.14, "inserindo traducao")
+            render_start = perf_counter()
+            try:
+                work_image = self.renderer.render(work_image, bubble)
+                record["render_ran"] = True
+            except Exception as exc:
+                if not record["skipped_reason"]:
+                    record["skipped_reason"] = f"erro na renderizacao: {exc}"
+                bubble.processing_notes.append(f"erro na renderizacao: {exc}")
+            render_elapsed += self._elapsed(render_start)
+
+        timings["clean"] = round(clean_elapsed, 4)
         self._save_debug_image("debug_after_cleanup.png", work_image)
         self._save_debug_image("after_cleanup.png", work_image)
-
-        step_start = perf_counter()
-        for index, bubble in enumerate(bubbles):
-            bubble_progress = index / total
-            if bubble.translated_text:
-                self._progress(progress_callback, 0.80 + bubble_progress * 0.14, "inserindo traducao")
-                record = flow_report[bubble.id]
-                try:
-                    work_image = self.renderer.render(work_image, bubble)
-                    record["render_ran"] = True
-                except Exception as exc:
-                    record["skipped_reason"] = f"erro na renderizacao: {exc}"
-                    bubble.processing_notes.append(f"erro na renderizacao: {exc}")
-        timings["render"] = self._elapsed(step_start)
+        timings["render"] = round(render_elapsed, 4)
 
         if not bubbles:
             self._progress(progress_callback, 0.80, "nenhum balao detectado")
@@ -174,9 +209,11 @@ class MangaTranslatorPipeline:
         self._save_debug_image("debug_final_rendered.png", work_image)
         self._save_debug_image("final.png", work_image)
         self._save_debug_image("final_with_bbox.png", self._draw_debug_bboxes(work_image, bubbles))
+
         flow_report_list = self._finalize_flow_report(bubbles, flow_report)
         if flow_report_path is not None:
             self._save_flow_report(flow_report_path, flow_report_list)
+
         detected_count = len(bubbles)
         ocr_count = sum(1 for bubble in bubbles if bubble.source_text)
         translated_count = sum(1 for bubble in bubbles if bubble.translated_text)
@@ -197,8 +234,9 @@ class MangaTranslatorPipeline:
             output_dir=Path(output_dir),
             metadata={
                 "bubble_count": len(bubbles),
-                "source_lang": resolve_translation_lang(self.config.source_lang),
-                "ocr_lang": resolve_ocr_lang(self.config.ocr_lang or self.config.source_lang),
+                "translation_mode": safe_text(self.config.translation_mode) or "en_to_pt",
+                "source_lang": safe_text(self.config.source_lang) or "en",
+                "ocr_lang": safe_text(self.config.ocr_lang) or "en",
                 "target_lang": safe_text(self.config.target_lang) or "pt",
                 "translation_style": safe_text(self.config.translation_style) or "natural",
                 "performance_mode": safe_text(self.config.performance_mode) or "balanced",
@@ -222,22 +260,23 @@ class MangaTranslatorPipeline:
 
     @classmethod
     def _progress(cls, callback, value: float, message: str) -> None:
-        if callback is not None:
-            clamped = float(max(0.0, min(1.0, value)))
-            safe_message = safe_text(message)
-            stage_id, stage_label = cls.PROGRESS_STAGE_MAP.get(
-                safe_message.lower(),
-                ("processing", safe_message.capitalize() or "Processando"),
-            )
-            meta = {
-                "stage_id": stage_id,
-                "stage_label": stage_label,
-                "stage_status": "done" if clamped >= 1.0 else "running",
-            }
-            try:
-                callback(clamped, safe_message, meta)
-            except TypeError:
-                callback(clamped, safe_message)
+        if callback is None:
+            return
+        clamped = float(max(0.0, min(1.0, value)))
+        safe_message = safe_text(message)
+        stage_id, stage_label = cls.PROGRESS_STAGE_MAP.get(
+            safe_message.lower(),
+            ("processing", safe_message.capitalize() or "Processando"),
+        )
+        meta = {
+            "stage_id": stage_id,
+            "stage_label": stage_label,
+            "stage_status": "done" if clamped >= 1.0 else "running",
+        }
+        try:
+            callback(clamped, safe_message, meta)
+        except TypeError:
+            callback(clamped, safe_message)
 
     @staticmethod
     def _elapsed(start: float) -> float:
@@ -247,6 +286,9 @@ class MangaTranslatorPipeline:
     def _masked_crop_for_ocr(image: np.ndarray, bubble: SpeechBubble) -> np.ndarray:
         crop = image[bubble.bbox.y1 : bubble.bbox.y2, bubble.bbox.x1 : bubble.bbox.x2]
         if crop is None or crop.size == 0:
+            return crop
+
+        if getattr(bubble, "mask", None) is None or bubble.mask.size == 0:
             return crop
 
         mask_crop = bubble.mask[bubble.bbox.y1 : bubble.bbox.y2, bubble.bbox.x1 : bubble.bbox.x2]

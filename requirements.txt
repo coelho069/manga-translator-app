@@ -9,3 +9,4 @@ paddlepaddle==2.6.2
 deep-translator>=1.11.4
 huggingface_hub>=0.23.0
 streamlit>=1.33.0
+pymupdf

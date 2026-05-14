@@ -5,27 +5,52 @@ from pathlib import Path
 from app.config import AppConfig
 from app.pipeline import MangaTranslatorPipeline
 from app.types import AppResult
-from app.utils import ensure_dir, make_job_dir, resolve_ocr_lang, resolve_translation_lang, safe_text, sanitize_filename
+from app.utils import (
+    ensure_dir,
+    get_translation_mode_config,
+    make_job_dir,
+    resolve_ocr_lang,
+    resolve_translation_lang,
+    resolve_translation_mode,
+    safe_text,
+    sanitize_filename,
+)
 
 
 def process_uploaded_image(
     filename,
     content,
-    source_lang="en",
+    translation_mode="en_to_pt",
+    source_lang=None,
+    target_lang=None,
+    ocr_lang=None,
     translation_style="natural",
     performance_mode="balanced",
     debug_enabled=False,
     progress_callback=None,
 ) -> AppResult:
-    translation_lang = resolve_translation_lang(source_lang)
-    ocr_lang = resolve_ocr_lang(source_lang)
+    mode_key = resolve_translation_mode(translation_mode)
+    mode_config = get_translation_mode_config(mode_key)
+    resolved_source_lang = resolve_translation_lang(source_lang or mode_config["source_lang"])
+    resolved_target_lang = resolve_translation_lang(target_lang or mode_config["target_lang"])
+    resolved_ocr_lang = safe_text(ocr_lang) or mode_config["ocr_lang"] or resolve_ocr_lang(resolved_source_lang)
+    resolved_ocr_lang = resolve_ocr_lang(resolved_ocr_lang)
+
     style = safe_text(translation_style).lower()
     if style not in {"natural", "literal"}:
         style = "natural"
-    mode = safe_text(performance_mode).lower()
-    if mode not in {"quality", "balanced", "fast"}:
-        mode = "balanced"
-    config = _build_config(translation_lang, ocr_lang, style, mode, bool(debug_enabled))
+    perf_mode = safe_text(performance_mode).lower()
+    if perf_mode not in {"quality", "balanced", "fast"}:
+        perf_mode = "balanced"
+    config = _build_config(
+        translation_mode=resolve_translation_mode(translation_mode),
+        source_lang=resolved_source_lang,
+        target_lang=resolved_target_lang,
+        ocr_lang=resolved_ocr_lang,
+        translation_style=style,
+        performance_mode=perf_mode,
+        debug_enabled=bool(debug_enabled),
+    )
     ensure_dir(config.output_dir)
     job_dir = make_job_dir(config.output_dir)
 
@@ -37,10 +62,19 @@ def process_uploaded_image(
     return pipeline.run(input_path, output_dir=job_dir, progress_callback=progress_callback)
 
 
-def _build_config(source_lang: str, ocr_lang: str, translation_style: str, performance_mode: str, debug_enabled: bool) -> AppConfig:
+def _build_config(
+    translation_mode: str,
+    source_lang: str,
+    target_lang: str,
+    ocr_lang: str,
+    translation_style: str,
+    performance_mode: str,
+    debug_enabled: bool,
+) -> AppConfig:
     base = {
+        "translation_mode": resolve_translation_mode(translation_mode),
         "source_lang": source_lang,
-        "target_lang": "pt",
+        "target_lang": target_lang,
         "ocr_lang": ocr_lang,
         "translation_style": translation_style,
         "performance_mode": performance_mode,

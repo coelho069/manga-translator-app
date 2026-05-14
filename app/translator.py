@@ -10,18 +10,27 @@ from app.utils import resolve_translation_lang, safe_text
 
 
 IDIOMATIC_MAP = {
-    "no way": "não pode ser",
+    "no way": "nao pode ser",
     "i got it": "entendi",
     "got it": "entendi",
     "shut up": "cala a boca",
     "damn it": "droga",
     "what the hell": "que diabos",
-    "are you okay": "você está bem",
+    "are you okay": "voce esta bem",
     "leave it to me": "deixa comigo",
-    "i'm counting on you": "conto com você",
+    "i'm counting on you": "conto com voce",
     "i will protect you": "eu vou te proteger",
-    "don't give up": "não desista",
+    "don't give up": "nao desista",
 }
+
+JA_HONORIFICS = [
+    "さん",
+    "くん",
+    "ちゃん",
+    "先輩",
+    "先生",
+    "様",
+]
 
 COMMON_INITIAL_WORDS = {
     "A",
@@ -92,8 +101,9 @@ class GoogleTextTranslator(BaseTranslator):
 
     def __init__(self, config: AppConfig):
         self.config = config
+        self.translation_mode = safe_text(config.translation_mode) or "en_to_pt"
         self.source_lang = resolve_translation_lang(config.source_lang)
-        self.target_lang = safe_text(config.target_lang) or "pt"
+        self.target_lang = resolve_translation_lang(config.target_lang)
         self.translation_style = self._normalize_style(config.translation_style)
         self._page_memory: dict[str, str] = {}
 
@@ -139,8 +149,8 @@ class GoogleTextTranslator(BaseTranslator):
             translated = protected_text
 
         translated = self._restore_terms(translated, placeholders)
-        translated = normalize_translation_pt(translated)
-        translated = preserve_terminal_punctuation(original, translated)
+        translated = normalize_translation_text(translated, self.target_lang)
+        translated = preserve_terminal_punctuation(original, translated, self.target_lang)
         return translated or original
 
     def _idiomatic_translation(self, text: str) -> str:
@@ -152,18 +162,22 @@ class GoogleTextTranslator(BaseTranslator):
         mapped = IDIOMATIC_MAP.get(key)
         if not mapped:
             return ""
-        return normalize_translation_pt(mapped + punctuation)
+        return normalize_translation_text(mapped + punctuation, "pt")
 
     def _protect_terms(self, text: str) -> tuple[str, dict[str, str]]:
-        if self.source_lang != "en":
-            return text, {}
-
         placeholders: dict[str, str] = {}
         protected = text
 
-        protected, placeholders = _protect_matches(protected, GLOSSARY.keys(), placeholders)
-        names = detect_proper_names(protected)
-        protected, placeholders = _protect_matches(protected, names, placeholders)
+        if self.source_lang == "en":
+            protected, placeholders = _protect_matches(protected, GLOSSARY.keys(), placeholders)
+            names = detect_proper_names(protected)
+            protected, placeholders = _protect_matches(protected, names, placeholders)
+            return protected, placeholders
+
+        if self.source_lang == "ja":
+            protected, placeholders = _protect_matches(protected, JA_HONORIFICS, placeholders)
+            return protected, placeholders
+
         return protected, placeholders
 
     @staticmethod
@@ -183,7 +197,7 @@ class GoogleTextTranslator(BaseTranslator):
         return "natural"
 
     @staticmethod
-    @lru_cache(maxsize=1024)
+    @lru_cache(maxsize=2048)
     def _translate_cached(text: str, source_lang: str, target_lang: str) -> str:
         try:
             translator = GoogleTextTranslator._get_client(source_lang, target_lang)
@@ -225,6 +239,13 @@ def detect_proper_names(text: str) -> list[str]:
     return _unique_by_length(names)
 
 
+def normalize_translation_text(text: str, target_lang: str) -> str:
+    normalized_target = resolve_translation_lang(target_lang)
+    if normalized_target == "pt":
+        return normalize_translation_pt(text)
+    return normalize_translation_en(text)
+
+
 def normalize_translation_pt(text: str) -> str:
     clean = safe_text(text)
     if not clean:
@@ -232,7 +253,6 @@ def normalize_translation_pt(text: str) -> str:
 
     clean = clean.replace("…", "...")
     clean = re.sub(r"\s+([,.;:!?])", r"\1", clean)
-    clean = re.sub(r"([¿¡])\s+", r"\1", clean)
     clean = re.sub(r"\s*\.\s*\.\s*\.", "...", clean)
     clean = re.sub(r"\.{4,}", "...", clean)
     clean = re.sub(r"!{3,}", "!!", clean)
@@ -242,7 +262,22 @@ def normalize_translation_pt(text: str) -> str:
     return safe_text(clean)
 
 
-def preserve_terminal_punctuation(source: str, translated: str) -> str:
+def normalize_translation_en(text: str) -> str:
+    clean = safe_text(text)
+    if not clean:
+        return ""
+
+    clean = clean.replace("…", "...")
+    clean = re.sub(r"\s+([,.;:!?])", r"\1", clean)
+    clean = re.sub(r"\s*\.\s*\.\s*\.", "...", clean)
+    clean = re.sub(r"\.{4,}", "...", clean)
+    clean = re.sub(r"!{3,}", "!!", clean)
+    clean = re.sub(r"\?{3,}", "??", clean)
+    clean = re.sub(r"\s+", " ", clean)
+    return safe_text(clean)
+
+
+def preserve_terminal_punctuation(source: str, translated: str, target_lang: str) -> str:
     clean_translated = safe_text(translated)
     if not clean_translated:
         return ""
@@ -252,7 +287,7 @@ def preserve_terminal_punctuation(source: str, translated: str) -> str:
         return clean_translated
     if re.search(r"([!?.]+|\?!|!\?)$", clean_translated):
         return clean_translated
-    return normalize_translation_pt(clean_translated + source_punctuation)
+    return normalize_translation_text(clean_translated + source_punctuation, target_lang)
 
 
 def _protect_matches(text: str, values, placeholders: dict[str, str]) -> tuple[str, dict[str, str]]:
@@ -279,6 +314,13 @@ def _unique_by_length(values: list[str]) -> list[str]:
 
 def _split_terminal_punctuation(text: str) -> tuple[str, str]:
     clean = safe_text(text)
+    if not clean:
+        return "", ""
+
+    for raw, mapped in ("！？", "?!"), ("？！", "?!"), ("。", "."), ("！", "!"), ("？", "?"), ("…", "..."):
+        if clean.endswith(raw):
+            return clean[: -len(raw)], mapped
+
     match = re.search(r"([!?.]+|\?!|!\?)$", clean)
     if not match:
         return clean, ""
