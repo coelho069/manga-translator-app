@@ -138,12 +138,15 @@ def redeem_key_for_ip(key: str, ip: str) -> bool:
                 save_keys(entries)
             return False
 
-        if bool(entry.get("redeemed", False)):
-            return entry.get("redeemed_ip") == clean_ip
+        redeemed_ips = _get_redeemed_ips(entry)
+        if clean_ip in redeemed_ips:
+            return True
 
+        redeemed_ips.append(clean_ip)
         entry["redeemed"] = True
         entry["redeemed_at"] = _format_datetime(_now())
         entry["redeemed_ip"] = clean_ip
+        entry["redeemed_ips"] = redeemed_ips
         save_keys(entries)
         return True
 
@@ -156,12 +159,10 @@ def is_key_allowed_for_ip(key: str, ip: str) -> bool:
         return False
     if is_key_expired(entry) or not bool(entry.get("active", True)):
         return False
-    if not bool(entry.get("redeemed", False)):
-        return True
-    return entry.get("redeemed_ip") == _clean_ip(ip)
+    return _clean_ip(ip) in _get_redeemed_ips(entry)
 
 
-def validate_key_for_ip(key: str, ip: str) -> dict[str, Any]:
+def validate_key_for_ip(key: str, ip: str, allow_used_ip: bool = True) -> dict[str, Any]:
     deactivate_expired_keys()
     clean_key = _clean_key(key)
     clean_ip = _clean_ip(ip)
@@ -188,8 +189,9 @@ def validate_key_for_ip(key: str, ip: str) -> dict[str, Any]:
             "record": dict(entry),
         }
 
-    if bool(entry.get("redeemed", False)):
-        if entry.get("redeemed_ip") == clean_ip:
+    redeemed_ips = _get_redeemed_ips(entry)
+    if clean_ip in redeemed_ips:
+        if allow_used_ip:
             return {
                 "valid": True,
                 "message": "",
@@ -199,7 +201,7 @@ def validate_key_for_ip(key: str, ip: str) -> dict[str, Any]:
             }
         return {
             "valid": False,
-            "message": "Esta KEY já foi resgatada por outro IP.",
+            "message": "Esta KEY já foi usada por este IP.",
             "key": clean_key,
             "ip": clean_ip,
             "record": dict(entry),
@@ -222,6 +224,7 @@ def reset_key_redemption(key: str) -> bool:
         redeemed=False,
         redeemed_at=None,
         redeemed_ip=None,
+        redeemed_ips=[],
     )
 
 
@@ -351,9 +354,13 @@ def _make_entry(
     redeemed: bool = False,
     redeemed_at: Any = None,
     redeemed_ip: Any = None,
+    redeemed_ips: Any = None,
 ) -> dict[str, Any]:
     clean_redeemed_at = _format_optional_datetime(redeemed_at) if redeemed else None
+    clean_redeemed_ips = _clean_ip_list(redeemed_ips)
     clean_redeemed_ip = _clean_ip(redeemed_ip) if redeemed and redeemed_ip else None
+    if clean_redeemed_ip and clean_redeemed_ip not in clean_redeemed_ips:
+        clean_redeemed_ips.append(clean_redeemed_ip)
     return {
         "key": _clean_key(key),
         "created_at": _format_datetime(created_at),
@@ -362,6 +369,7 @@ def _make_entry(
         "redeemed": bool(redeemed),
         "redeemed_at": clean_redeemed_at,
         "redeemed_ip": clean_redeemed_ip,
+        "redeemed_ips": clean_redeemed_ips if redeemed else [],
     }
 
 
@@ -406,6 +414,7 @@ def _entry_from_raw(raw_entry: Any) -> dict[str, Any] | None:
             bool(raw_entry.get("redeemed", False)),
             raw_entry.get("redeemed_at"),
             raw_entry.get("redeemed_ip"),
+            raw_entry.get("redeemed_ips"),
         )
 
     legacy_entry = _entry_from_legacy_dict_string(raw_entry)
@@ -477,6 +486,26 @@ def _entry_from_legacy_dict_string(raw_entry: Any) -> dict[str, Any] | None:
         redeemed_at_match.group(1) if redeemed_at_match else None,
         redeemed_ip_match.group(1) if redeemed_ip_match else None,
     )
+
+
+def _get_redeemed_ips(entry: dict[str, Any]) -> list[str]:
+    redeemed_ips = _clean_ip_list(entry.get("redeemed_ips"))
+    legacy_ip = _clean_ip(entry.get("redeemed_ip"))
+    if bool(entry.get("redeemed", False)) and legacy_ip and legacy_ip not in redeemed_ips:
+        redeemed_ips.append(legacy_ip)
+    return redeemed_ips
+
+
+def _clean_ip_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+
+    clean_ips: list[str] = []
+    for raw_ip in value:
+        clean_ip = _clean_ip(raw_ip)
+        if clean_ip and clean_ip not in clean_ips:
+            clean_ips.append(clean_ip)
+    return clean_ips
 
 
 def _extract_raw_keys(payload: Any) -> list[Any]:
