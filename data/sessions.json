@@ -1,0 +1,46 @@
+{
+  "sessions": [
+    {
+      "key": "ADMIN-2026",
+      "ip": "local",
+      "login_at": "2026-05-14T11:39:30",
+      "last_seen": "2026-05-14T11:40:28",
+      "active": false
+    },
+    {
+      "key": "MANGA-L3N4-AQRX-US73",
+      "ip": "local",
+      "login_at": "2026-05-14T11:40:35",
+      "last_seen": "2026-05-14T11:40:35",
+      "active": false
+    },
+    {
+      "key": "ADMIN-2026",
+      "ip": "local",
+      "login_at": "2026-05-14T11:40:51",
+      "last_seen": "2026-05-14T11:40:52",
+      "active": false
+    },
+    {
+      "key": "MANGA-L3N4-AQRX-US73",
+      "ip": "local",
+      "login_at": "2026-05-14T12:48:28",
+      "last_seen": "2026-05-14T12:48:28",
+      "active": false
+    },
+    {
+      "key": "ADMIN-2026",
+      "ip": "local",
+      "login_at": "2026-05-14T12:52:18",
+      "last_seen": "2026-05-14T12:52:18",
+      "active": true
+    },
+    {
+      "key": "MANGA-L3N4-AQRX-US73",
+      "ip": "local",
+      "login_at": "2026-05-14T12:52:35",
+      "last_seen": "2026-05-14T12:52:35",
+      "active": true
+    }
+  ]
+}
