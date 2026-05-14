@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+<<<<<<< HEAD
 import re
 from datetime import datetime
 from typing import Any
 
+=======
+>>>>>>> 8699666 (corrige sistema de login por key)
 import streamlit as st
 
 from app.key_manager import (
     add_key,
+<<<<<<< HEAD
     deactivate_expired_keys,
     generate_key,
     get_key_status,
@@ -27,6 +31,15 @@ from app.session_manager import (
     logout_session,
     register_login,
     update_last_seen,
+=======
+    generate_key,
+    is_admin_key,
+    is_valid_key,
+    list_admin_keys,
+    list_keys,
+    remove_key,
+    _clean_key,
+>>>>>>> 8699666 (corrige sistema de login por key)
 )
 
 
@@ -38,22 +51,30 @@ def _rerun() -> None:
 
 
 def is_authenticated() -> bool:
+<<<<<<< HEAD
     deactivate_expired_keys()
     ensure_sessions_file()
     deactivate_stale_sessions()
     key = str(st.session_state.get("user_key") or st.session_state.get("auth_key", "")).strip()
     current_ip = get_client_ip()
+=======
+    key = str(st.session_state.get("auth_key", "")).strip()
+>>>>>>> 8699666 (corrige sistema de login por key)
     authenticated = bool(st.session_state.get("authenticated")) and bool(key)
 
     if not authenticated:
         return False
 
+<<<<<<< HEAD
     validation = validate_key_for_ip(key, current_ip)
     if validation["valid"]:
         st.session_state["auth_key"] = validation["key"]
         st.session_state["user_key"] = validation["key"]
         st.session_state["user_ip"] = current_ip
         update_last_seen(validation["key"], validation["ip"])
+=======
+    if is_valid_key(key):
+>>>>>>> 8699666 (corrige sistema de login por key)
         return True
 
     logout()
@@ -62,6 +83,7 @@ def is_authenticated() -> bool:
 
 def login(key: str) -> bool:
     raw_key = str(key or "")
+<<<<<<< HEAD
     deactivate_expired_keys()
     current_ip = get_client_ip()
     validation = validate_key_for_ip(raw_key, current_ip)
@@ -77,10 +99,21 @@ def login(key: str) -> bool:
     st.session_state["user_ip"] = current_ip
     register_login(clean_key, validation["ip"])
     st.session_state.pop("login_error", None)
+=======
+    clean_key = _clean_key(raw_key)
+    valid = is_valid_key(raw_key)
+
+    if not valid:
+        return False
+
+    st.session_state["authenticated"] = True
+    st.session_state["auth_key"] = clean_key
+>>>>>>> 8699666 (corrige sistema de login por key)
     return True
 
 
 def logout() -> None:
+<<<<<<< HEAD
     current_key = str(st.session_state.get("user_key") or st.session_state.get("auth_key", "")).strip()
     current_ip = str(st.session_state.get("user_ip") or get_client_ip()).strip()
     if current_key:
@@ -95,6 +128,13 @@ def logout() -> None:
 
 def login_screen() -> None:
     deactivate_expired_keys()
+=======
+    st.session_state.pop("authenticated", None)
+    st.session_state.pop("auth_key", None)
+
+
+def login_screen() -> None:
+>>>>>>> 8699666 (corrige sistema de login por key)
     st.markdown("## Login por KEY")
 
     with st.form("key_login_form"):
@@ -106,12 +146,19 @@ def login_screen() -> None:
             st.success("KEY validada.")
             _rerun()
         else:
+<<<<<<< HEAD
             st.error(st.session_state.get("login_error", "KEY inválida."))
 
 
 def require_auth() -> None:
     deactivate_expired_keys()
     ensure_sessions_file()
+=======
+            st.error("KEY invalida.")
+
+
+def require_auth() -> None:
+>>>>>>> 8699666 (corrige sistema de login por key)
     if is_authenticated():
         render_key_panel()
         return
@@ -122,15 +169,21 @@ def require_auth() -> None:
 
 def render_key_panel() -> None:
     with st.sidebar:
+<<<<<<< HEAD
         current_key = st.session_state.get("user_key") or st.session_state.get("auth_key", "")
         st.markdown("### Acesso")
         st.write(f"KEY ativa: `{current_key}`")
         st.write(f"IP: `{st.session_state.get('user_ip', get_client_ip())}`")
+=======
+        st.markdown("### Acesso")
+        st.write(f"KEY ativa: `{st.session_state.get('auth_key', '')}`")
+>>>>>>> 8699666 (corrige sistema de login por key)
 
         if st.button("Sair", use_container_width=True):
             logout()
             _rerun()
 
+<<<<<<< HEAD
         admin_keys = set(list_admin_keys())
         if admin_keys and not is_admin_key(current_key):
             return
@@ -169,6 +222,18 @@ def render_key_panel() -> None:
                 expiration_hours=expiration_hours,
                 expiration_days=expiration_days,
             )
+=======
+        if not is_admin_key(st.session_state.get("auth_key", "")):
+            return
+
+        st.divider()
+        st.markdown("### Painel de keys")
+        st.caption("Disponivel apenas para a key especial.")
+
+        if st.button("Gerar nova key", use_container_width=True):
+            new_key = generate_key()
+            add_key(new_key)
+>>>>>>> 8699666 (corrige sistema de login por key)
             st.session_state["last_generated_key"] = new_key
             st.success(f"Nova key: {new_key}")
             _rerun()
@@ -178,11 +243,16 @@ def render_key_panel() -> None:
             st.info(f"Ultima key gerada: {last_generated_key}")
 
         keys = list_keys()
+<<<<<<< HEAD
+=======
+        admin_keys = set(list_admin_keys())
+>>>>>>> 8699666 (corrige sistema de login por key)
         if not keys:
             st.warning("Nenhuma key cadastrada.")
             return
 
         st.markdown("#### Keys cadastradas")
+<<<<<<< HEAD
         for entry in keys:
             key = entry["key"]
             status = get_key_status(key)
@@ -372,3 +442,16 @@ def _extract_ip_from_header(header_name: str, value: str) -> str:
         text = text.split(",", 1)[0]
 
     return text.strip().strip("\"[]") or ""
+=======
+        for key in keys:
+            key_col, remove_col = st.columns([0.72, 0.28])
+            key_col.code(key, language="text")
+            if key in admin_keys:
+                remove_col.caption("Especial")
+                continue
+            if remove_col.button("Remover", key=f"remove_key_{key}", use_container_width=True):
+                removed = remove_key(key)
+                if removed and key == st.session_state.get("auth_key"):
+                    logout()
+                _rerun()
+>>>>>>> 8699666 (corrige sistema de login por key)

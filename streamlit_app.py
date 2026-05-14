@@ -7,6 +7,7 @@ import zipfile
 
 import streamlit as st
 
+from app.auth import require_auth
 from app.backend import process_uploaded_image
 from app.pdf_utils import get_pdf_page_count, iter_pdf_pages
 from app.utils import ensure_dir, get_translation_mode_config, get_translation_mode_labels
@@ -71,6 +72,7 @@ def normalize_cache_entry(value):
     return None
 
 
+<<<<<<< HEAD
 def render_page_success(slot, page_number: int, translated_path: Path, job_key: str) -> None:
     with slot.container():
         st.markdown(f"### Pagina {page_number}")
@@ -83,6 +85,72 @@ def render_page_success(slot, page_number: int, translated_path: Path, job_key: 
                 mime="image/png",
                 key=f"download_{job_key}",
                 use_container_width=True,
+=======
+def show_completion_feedback(job_key: str, from_cache: bool = False) -> None:
+    if from_cache:
+        if hasattr(st, "toast"):
+            st.toast("Resultado reaproveitado da sessão.", icon="♻️")
+        return
+    celebration_key = f"celebrated_{job_key}"
+    if st.session_state.get(celebration_key):
+        return
+    st.session_state[celebration_key] = True
+    if hasattr(st, "toast"):
+        st.toast("Tradução concluída. Página pronta para baixar!", icon="✅")
+    try:
+        st.balloons()
+    except Exception:
+        pass
+
+
+st.set_page_config(page_title="Manga Translator App", page_icon="💬", layout="wide")
+inject_theme()
+require_auth()
+render_header()
+
+example_files = sorted(EXAMPLES_DIR.glob("*.png")) if EXAMPLES_DIR.exists() else []
+
+section_title("Entrada e configurações", "Escolha a imagem e ajuste idioma/estilo antes de iniciar a missão.")
+settings_col, preview_col = st.columns([0.92, 1.08], gap="large")
+
+with settings_col:
+    with st.container(border=True):
+        st.markdown("#### 🎮 Configurações da missão")
+        source_lang_label = st.selectbox("Idioma de entrada", list(LANG_OPTIONS.keys()))
+        source_lang = LANG_OPTIONS[source_lang_label]
+
+        translation_style_label = st.selectbox("Estilo de tradução", list(STYLE_OPTIONS.keys()))
+        translation_style = STYLE_OPTIONS[translation_style_label]
+        performance_label = st.selectbox("Modo de performance", list(PERFORMANCE_OPTIONS.keys()))
+        performance_mode = PERFORMANCE_OPTIONS[performance_label]
+        debug_enabled = False
+
+        st.markdown("#### 🖼️ Página do mangá")
+
+        use_example = False
+        selected_example = None
+
+        uploaded_file = st.file_uploader(
+            "Enviar página de mangá",
+            type=["png", "jpg", "jpeg"],
+            help="Use PNG, JPG ou JPEG. Para melhores resultados, prefira imagens nítidas e com boa resolução.",
+        )
+
+        st.caption("Saída: português. Processamento local em CPU por padrão.")
+
+content, filename = get_input_image(use_example, selected_example, uploaded_file)
+
+with preview_col:
+    with st.container(border=True):
+        st.markdown("#### Pré-visualização")
+        if content is not None and filename is not None:
+            status_pill(f"Imagem pronta: {filename}")
+            st.image(content, caption="Imagem selecionada", use_container_width=True)
+        else:
+            empty_state(
+                "Nenhuma imagem selecionada",
+                "Envie um arquivo ou escolha um exemplo para liberar a tradução.",
+>>>>>>> 8699666 (corrige sistema de login por key)
             )
         st.divider()
 

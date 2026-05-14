@@ -1,5 +1,6 @@
 {
   "keys": [
+<<<<<<< HEAD
     {
       "key": "ADMIN-2026",
       "created_at": "2026-05-14T10:00:00",
@@ -24,5 +25,14 @@
         "local"
       ]
     }
+=======
+    "ADMIN-2026",
+    "MANGA-ACCESS",
+    "TESTE-KEY",
+    "MANGA-NGBC-NYQX-6UVZ"
+  ],
+  "admin_keys": [
+    "ADMIN-2026"
+>>>>>>> 8699666 (corrige sistema de login por key)
   ]
 }

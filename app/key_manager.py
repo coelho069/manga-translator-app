@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+<<<<<<< HEAD
 import re
 import secrets
 import unicodedata
@@ -13,6 +14,14 @@ DEFAULT_KEYS = ("ADMIN-2026", "MANGA-ACCESS", "TESTE-KEY")
 ADMIN_KEY = "ADMIN-2026"
 DEFAULT_EXPIRATION_DAYS = 365
 
+=======
+import secrets
+import unicodedata
+from pathlib import Path
+from typing import Iterable, Any
+
+
+>>>>>>> 8699666 (corrige sistema de login por key)
 INVISIBLE_CHARS = {
     "\ufeff",
     "\u200b",
@@ -39,6 +48,7 @@ def ensure_keys_file() -> Path:
     keys_file.parent.mkdir(parents=True, exist_ok=True)
 
     if not keys_file.exists():
+<<<<<<< HEAD
         save_keys(_default_entries())
         return keys_file
 
@@ -51,10 +61,33 @@ def ensure_keys_file() -> Path:
     normalized_payload = {"keys": entries}
     if payload != normalized_payload:
         _write_payload(keys_file, entries)
+=======
+        keys_file.write_text(
+            json.dumps(
+                {
+                    "keys": ["ADMIN-2026", "MANGA-ACCESS", "TESTE-KEY"],
+                    "admin_keys": ["ADMIN-2026"],
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return keys_file
+
+    payload = _read_payload(keys_file)
+    keys = _normalize_keys(_extract_keys(payload))
+    admin_keys = _normalize_keys(_extract_admin_keys(payload))
+
+    if not isinstance(payload, dict) or "admin_keys" not in payload:
+        if "ADMIN-2026" in keys and "ADMIN-2026" not in admin_keys:
+            admin_keys.append("ADMIN-2026")
+        _write_payload(keys_file, keys, admin_keys)
+>>>>>>> 8699666 (corrige sistema de login por key)
 
     return keys_file
 
 
+<<<<<<< HEAD
 def load_keys() -> list[dict[str, Any]]:
     keys_file = ensure_keys_file()
     payload = _read_payload(keys_file)
@@ -385,11 +418,22 @@ def _normalize_entries(keys: Iterable[Any]) -> list[dict[str, Any]]:
         key = entry["key"]
         if key and key not in seen:
             normalized.append(entry)
+=======
+def _normalize_keys(keys: Iterable[Any]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+
+    for raw_key in keys:
+        key = _clean_key(raw_key)
+        if key and key not in seen:
+            normalized.append(key)
+>>>>>>> 8699666 (corrige sistema de login por key)
             seen.add(key)
 
     return normalized
 
 
+<<<<<<< HEAD
 def _entry_from_raw(raw_entry: Any) -> dict[str, Any] | None:
     created_at = _now()
     expires_at = created_at + timedelta(days=DEFAULT_EXPIRATION_DAYS)
@@ -509,6 +553,9 @@ def _clean_ip_list(value: Any) -> list[str]:
 
 
 def _extract_raw_keys(payload: Any) -> list[Any]:
+=======
+def _extract_keys(payload: Any) -> list[Any]:
+>>>>>>> 8699666 (corrige sistema de login por key)
     if isinstance(payload, list):
         return payload
     if isinstance(payload, dict) and isinstance(payload.get("keys"), list):
@@ -516,6 +563,7 @@ def _extract_raw_keys(payload: Any) -> list[Any]:
     return []
 
 
+<<<<<<< HEAD
 def _resolve_entry(key_or_entry: str | dict[str, Any]) -> dict[str, Any] | None:
     if isinstance(key_or_entry, dict):
         return _entry_from_raw(key_or_entry)
@@ -581,6 +629,12 @@ def _format_optional_datetime(value: Any) -> str | None:
         return _format_datetime(parsed)
     text = str(value).strip()
     return text or None
+=======
+def _extract_admin_keys(payload: Any) -> list[Any]:
+    if isinstance(payload, dict) and isinstance(payload.get("admin_keys"), list):
+        return payload["admin_keys"]
+    return []
+>>>>>>> 8699666 (corrige sistema de login por key)
 
 
 def _clean_key(key: Any) -> str:
@@ -595,11 +649,14 @@ def _clean_key(key: Any) -> str:
     return text.strip().upper()
 
 
+<<<<<<< HEAD
 def _clean_ip(ip: Any) -> str:
     text = str(ip or "").strip()
     return text or "local"
 
 
+=======
+>>>>>>> 8699666 (corrige sistema de login por key)
 def _read_payload(keys_file: Path) -> Any:
     try:
         return json.loads(keys_file.read_text(encoding="utf-8"))
@@ -608,9 +665,111 @@ def _read_payload(keys_file: Path) -> Any:
         return {}
 
 
+<<<<<<< HEAD
 def _write_payload(keys_file: Path, entries: Iterable[dict[str, Any]]) -> None:
     keys_file.parent.mkdir(parents=True, exist_ok=True)
     keys_file.write_text(
         json.dumps({"keys": list(entries)}, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
+=======
+def _write_payload(keys_file: Path, keys: Iterable[Any], admin_keys: Iterable[Any]) -> dict[str, list[str]]:
+    normalized_keys = _normalize_keys(keys)
+    normalized_admin_keys = [
+        key for key in _normalize_keys(admin_keys)
+        if key in normalized_keys
+    ]
+    payload = {
+        "keys": normalized_keys,
+        "admin_keys": normalized_admin_keys,
+    }
+    keys_file.parent.mkdir(parents=True, exist_ok=True)
+    keys_file.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return payload
+
+
+def load_keys() -> list[str]:
+    keys_file = ensure_keys_file()
+    payload = _read_payload(keys_file)
+
+    keys = _normalize_keys(_extract_keys(payload))
+    return keys
+
+
+def save_keys(keys: Iterable[Any]) -> list[str]:
+    keys_file = get_keys_file()
+    payload = _read_payload(ensure_keys_file())
+    admin_keys = _normalize_keys(_extract_admin_keys(payload))
+    saved_payload = _write_payload(keys_file, keys, admin_keys)
+    normalized = saved_payload["keys"]
+    return normalized
+
+
+def generate_key() -> str:
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+    while True:
+        chunks = [
+            "".join(secrets.choice(alphabet) for _ in range(4))
+            for _ in range(3)
+        ]
+        key = f"MANGA-{'-'.join(chunks)}"
+        if key not in load_keys():
+            return key
+
+
+def add_key(key: str) -> bool:
+    clean_key = _clean_key(key)
+    if not clean_key:
+        return False
+
+    keys = load_keys()
+    if clean_key in keys:
+        return False
+
+    keys.append(clean_key)
+    save_keys(keys)
+    return True
+
+
+def remove_key(key: str) -> bool:
+    clean_key = _clean_key(key)
+    keys = load_keys()
+    updated_keys = [existing_key for existing_key in keys if existing_key != clean_key]
+
+    if len(updated_keys) == len(keys):
+        return False
+
+    save_keys(updated_keys)
+    return True
+
+
+def is_valid_key(key: str) -> bool:
+    raw_key = str(key or "")
+    clean_key = _clean_key(raw_key)
+    keys = load_keys()
+    return clean_key in keys
+
+
+def list_admin_keys() -> list[str]:
+    keys_file = ensure_keys_file()
+    payload = _read_payload(keys_file)
+    keys = load_keys()
+    return [
+        admin_key for admin_key in _normalize_keys(_extract_admin_keys(payload))
+        if admin_key in keys
+    ]
+
+
+def is_admin_key(key: str) -> bool:
+    clean_key = _clean_key(key)
+    admin_keys = list_admin_keys()
+    return clean_key in admin_keys
+
+
+def list_keys() -> list[str]:
+    return load_keys()
+>>>>>>> 8699666 (corrige sistema de login por key)
