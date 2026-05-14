@@ -848,7 +848,6 @@ def bubble_info_card(bubble, source_label: str) -> None:
 
 def render_result(result, source_lang_label: str, performance_label: str) -> None:
     metadata = result.metadata or {}
-    timings = metadata.get("timings", {}) or {}
     counts = count_result_items(result)
     total_time = format_seconds(counts["total_time"])
     subtitle = "Compare a página original com a versão editada."
@@ -885,26 +884,6 @@ def render_result(result, source_lang_label: str, performance_label: str) -> Non
             mime="image/png",
             use_container_width=True,
         )
-
-    if timings:
-        with st.expander("Tempos técnicos por etapa"):
-            st.json(timings)
-
-    skipped = metadata.get("skipped_bubbles") or []
-    if skipped:
-        with st.expander("Avisos do processamento"):
-            st.json(skipped)
-
-    section_title("Textos detectados", "Revise o OCR e a tradução aplicada em cada balão.")
-    if result.bubbles:
-        for bubble in result.bubbles:
-            bubble_info_card(bubble, source_lang_label)
-    else:
-        empty_state(
-            "Nenhum balão detectado",
-            "Confira se o modelo models/bubble_seg.pt é adequado para esse tipo de página.",
-        )
-
 
 def render_error(exc: Exception, stage_state: dict[str, str], active_stage_id: str, technical_traceback: str) -> None:
     mark_stage_error(stage_state, active_stage_id)
