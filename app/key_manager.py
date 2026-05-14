@@ -117,6 +117,114 @@ def is_valid_key(key: str) -> bool:
     return bool(status["exists"] and status["active"] and not status["expired"])
 
 
+def get_key_record(key: str) -> dict[str, Any] | None:
+    deactivate_expired_keys()
+    entry = _find_entry(key)
+    return dict(entry) if entry else None
+
+
+def redeem_key_for_ip(key: str, ip: str) -> bool:
+    clean_key = _clean_key(key)
+    clean_ip = _clean_ip(ip)
+    entries = load_keys()
+
+    for entry in entries:
+        if entry["key"] != clean_key:
+            continue
+
+        if is_key_expired(entry) or not bool(entry.get("active", True)):
+            if bool(entry.get("active", True)):
+                entry["active"] = False
+                save_keys(entries)
+            return False
+
+        if bool(entry.get("redeemed", False)):
+            return entry.get("redeemed_ip") == clean_ip
+
+        entry["redeemed"] = True
+        entry["redeemed_at"] = _format_datetime(_now())
+        entry["redeemed_ip"] = clean_ip
+        save_keys(entries)
+        return True
+
+    return False
+
+
+def is_key_allowed_for_ip(key: str, ip: str) -> bool:
+    entry = get_key_record(key)
+    if not entry:
+        return False
+    if is_key_expired(entry) or not bool(entry.get("active", True)):
+        return False
+    if not bool(entry.get("redeemed", False)):
+        return True
+    return entry.get("redeemed_ip") == _clean_ip(ip)
+
+
+def validate_key_for_ip(key: str, ip: str) -> dict[str, Any]:
+    deactivate_expired_keys()
+    clean_key = _clean_key(key)
+    clean_ip = _clean_ip(ip)
+    entry = _find_entry(clean_key)
+
+    if not entry:
+        return {
+            "valid": False,
+            "message": "KEY inválida.",
+            "key": clean_key,
+            "ip": clean_ip,
+            "record": None,
+        }
+
+    if is_key_expired(entry) or not bool(entry.get("active", True)):
+        if bool(entry.get("active", True)):
+            _set_key_fields(clean_key, active=False)
+            entry = _find_entry(clean_key) or entry
+        return {
+            "valid": False,
+            "message": "KEY expirada.",
+            "key": clean_key,
+            "ip": clean_ip,
+            "record": dict(entry),
+        }
+
+    if bool(entry.get("redeemed", False)):
+        if entry.get("redeemed_ip") == clean_ip:
+            return {
+                "valid": True,
+                "message": "",
+                "key": clean_key,
+                "ip": clean_ip,
+                "record": dict(entry),
+            }
+        return {
+            "valid": False,
+            "message": "Esta KEY já foi resgatada por outro IP.",
+            "key": clean_key,
+            "ip": clean_ip,
+            "record": dict(entry),
+        }
+
+    redeem_key_for_ip(clean_key, clean_ip)
+    entry = _find_entry(clean_key) or entry
+    return {
+        "valid": True,
+        "message": "",
+        "key": clean_key,
+        "ip": clean_ip,
+        "record": dict(entry),
+    }
+
+
+def reset_key_redemption(key: str) -> bool:
+    return _set_key_fields(
+        key,
+        redeemed=False,
+        redeemed_at=None,
+        redeemed_ip=None,
+    )
+
+
 def is_key_expired(key_or_entry: str | dict[str, Any]) -> bool:
     entry = _resolve_entry(key_or_entry)
     if not entry:
@@ -181,6 +289,9 @@ def get_key_status(key: str) -> dict[str, Any]:
             "expires_at": "",
             "active": False,
             "expired": False,
+            "redeemed": False,
+            "redeemed_at": None,
+            "redeemed_ip": None,
             "remaining_time": "inexistente",
             "status": "inexistente",
         }
@@ -196,6 +307,9 @@ def get_key_status(key: str) -> dict[str, Any]:
         "expires_at": entry["expires_at"],
         "active": active,
         "expired": expired,
+        "redeemed": bool(entry.get("redeemed", False)),
+        "redeemed_at": entry.get("redeemed_at"),
+        "redeemed_ip": entry.get("redeemed_ip"),
         "remaining_time": get_remaining_time(entry),
         "status": status,
     }
@@ -229,12 +343,25 @@ def _default_entries() -> list[dict[str, Any]]:
     return [_make_entry(key, created_at, expires_at, True) for key in DEFAULT_KEYS]
 
 
-def _make_entry(key: Any, created_at: datetime, expires_at: datetime, active: bool) -> dict[str, Any]:
+def _make_entry(
+    key: Any,
+    created_at: datetime,
+    expires_at: datetime,
+    active: bool,
+    redeemed: bool = False,
+    redeemed_at: Any = None,
+    redeemed_ip: Any = None,
+) -> dict[str, Any]:
+    clean_redeemed_at = _format_optional_datetime(redeemed_at) if redeemed else None
+    clean_redeemed_ip = _clean_ip(redeemed_ip) if redeemed and redeemed_ip else None
     return {
         "key": _clean_key(key),
         "created_at": _format_datetime(created_at),
         "expires_at": _format_datetime(expires_at),
         "active": bool(active),
+        "redeemed": bool(redeemed),
+        "redeemed_at": clean_redeemed_at,
+        "redeemed_ip": clean_redeemed_ip,
     }
 
 
@@ -276,6 +403,9 @@ def _entry_from_raw(raw_entry: Any) -> dict[str, Any] | None:
             created_at,
             expires_at,
             bool(raw_entry.get("active", True)),
+            bool(raw_entry.get("redeemed", False)),
+            raw_entry.get("redeemed_at"),
+            raw_entry.get("redeemed_ip"),
         )
 
     legacy_entry = _entry_from_legacy_dict_string(raw_entry)
@@ -312,6 +442,21 @@ def _entry_from_legacy_dict_string(raw_entry: Any) -> dict[str, Any] | None:
         raw_entry,
         re.IGNORECASE,
     )
+    redeemed_match = re.search(
+        r"['\"]?redeemed['\"]?\s*:\s*(true|false|1|0)",
+        raw_entry,
+        re.IGNORECASE,
+    )
+    redeemed_at_match = re.search(
+        r"['\"]?redeemed_at['\"]?\s*:\s*['\"]([^'\"]+)['\"]",
+        raw_entry,
+        re.IGNORECASE,
+    )
+    redeemed_ip_match = re.search(
+        r"['\"]?redeemed_ip['\"]?\s*:\s*['\"]([^'\"]+)['\"]",
+        raw_entry,
+        re.IGNORECASE,
+    )
 
     now = _now()
     created_at = _parse_datetime(created_match.group(1)) if created_match else None
@@ -319,12 +464,18 @@ def _entry_from_legacy_dict_string(raw_entry: Any) -> dict[str, Any] | None:
     active = True
     if active_match:
         active = active_match.group(1).lower() in {"true", "1"}
+    redeemed = False
+    if redeemed_match:
+        redeemed = redeemed_match.group(1).lower() in {"true", "1"}
 
     return _make_entry(
         key_match.group(1),
         created_at or now,
         expires_at or now + timedelta(days=DEFAULT_EXPIRATION_DAYS),
         active,
+        redeemed,
+        redeemed_at_match.group(1) if redeemed_at_match else None,
+        redeemed_ip_match.group(1) if redeemed_ip_match else None,
     )
 
 
@@ -348,6 +499,20 @@ def _find_entry(key: str) -> dict[str, Any] | None:
         if entry["key"] == clean_key:
             return entry
     return None
+
+
+def _set_key_fields(key: str, **fields: Any) -> bool:
+    clean_key = _clean_key(key)
+    entries = load_keys()
+
+    for entry in entries:
+        if entry["key"] != clean_key:
+            continue
+        entry.update(fields)
+        save_keys(entries)
+        return True
+
+    return False
 
 
 def _resolve_expiration(
@@ -377,6 +542,18 @@ def _format_datetime(value: datetime) -> str:
     return value.replace(microsecond=0).isoformat()
 
 
+def _format_optional_datetime(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return _format_datetime(value)
+    parsed = _parse_datetime(value)
+    if parsed is not None:
+        return _format_datetime(parsed)
+    text = str(value).strip()
+    return text or None
+
+
 def _clean_key(key: Any) -> str:
     text = unicodedata.normalize("NFKC", str(key or ""))
     for invisible_char in INVISIBLE_CHARS:
@@ -387,6 +564,11 @@ def _clean_key(key: Any) -> str:
     text = text.strip().strip(",")
     text = text.strip("\"'` ")
     return text.strip().upper()
+
+
+def _clean_ip(ip: Any) -> str:
+    text = str(ip or "").strip()
+    return text or "local"
 
 
 def _read_payload(keys_file: Path) -> Any:
