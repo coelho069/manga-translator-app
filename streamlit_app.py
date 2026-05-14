@@ -9,6 +9,7 @@ from typing import Any
 import streamlit as st
 from PIL import Image
 
+from app.auth import require_auth
 from app.backend import process_uploaded_image
 
 
@@ -945,6 +946,7 @@ def show_completion_feedback(job_key: str, from_cache: bool = False) -> None:
 
 st.set_page_config(page_title="Manga Translator App", page_icon="💬", layout="wide")
 inject_theme()
+require_auth()
 render_header()
 
 example_files = sorted(EXAMPLES_DIR.glob("*.png")) if EXAMPLES_DIR.exists() else []
