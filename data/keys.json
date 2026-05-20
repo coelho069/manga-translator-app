@@ -16,7 +16,7 @@
       "key": "MANGA-L3N4-AQRX-US73",
       "created_at": "2026-05-14T10:19:48",
       "expires_at": "2026-05-16T10:19:48",
-      "active": true,
+      "active": false,
       "redeemed": true,
       "redeemed_at": "2026-05-14T10:42:15",
       "redeemed_ip": "local",

@@ -7,16 +7,10 @@ import zipfile
 
 import streamlit as st
 
-from app.backend import process_uploaded_image
+from app.auth import require_auth
+from app.backend import create_batch_zip, process_batch, process_uploaded_image
 from app.pdf_utils import get_pdf_page_count, iter_pdf_pages
 from app.utils import ensure_dir, get_translation_mode_config, get_translation_mode_labels
-
-
-translation_style = "natural"
-translation_style_label = "Natural"
-performance_mode = "balanced"
-performance_label = "Equilibrado"
-debug_enabled = False
 
 
 def clean_text(value) -> str:
@@ -166,6 +160,7 @@ def gather_inputs(uploaded_files, status_placeholder):
 
 
 st.set_page_config(page_title="Manga Translator", page_icon="📚", layout="centered")
+require_auth()
 init_state()
 
 st.title("Manga Translator")
@@ -181,6 +176,38 @@ target_lang = selected_mode_config["target_lang"]
 ocr_lang = selected_mode_config["ocr_lang"]
 translation_mode = selected_mode_config["mode"]
 translation_mode_label = selected_mode_config["label"]
+
+with st.sidebar:
+    st.markdown("### Performance")
+    perf_mode_label = st.selectbox(
+        "Modo de processamento",
+        ["Rapido", "Equilibrado", "Qualidade"],
+        index=1,
+    )
+    perf_mode_map = {"Rapido": "fast", "Equilibrado": "balanced", "Qualidade": "quality"}
+    performance_mode = perf_mode_map[perf_mode_label]
+
+    use_translation_cache = st.checkbox("Usar cache de traducao", value=True)
+    debug_enabled = not st.checkbox("Desativar debug para acelerar", value=True)
+
+    st.markdown("### Configuracao de Fonte")
+    min_font_size = st.slider("Tamanho minimo da fonte", min_value=6, max_value=24, value=9, step=1)
+    max_font_size = st.slider("Tamanho maximo da fonte", min_value=12, max_value=64, value=32, step=1)
+    if min_font_size > max_font_size:
+        min_font_size = max_font_size
+    line_spacing_ratio = st.slider("Espacamento entre linhas", min_value=0.8, max_value=2.0, value=1.12, step=0.02)
+    auto_font_resize = st.checkbox("Ajuste automatico da fonte", value=True)
+    center_text = st.checkbox("Centralizar texto", value=True)
+    bold_text = st.checkbox("Negrito", value=False)
+    text_color_hex = st.color_picker("Cor da fonte", value="#000000")
+    text_color = (
+        int(text_color_hex[1:3], 16),
+        int(text_color_hex[3:5], 16),
+        int(text_color_hex[5:7], 16),
+    )
+
+translation_style = "natural"
+translation_style_label = "Natural"
 
 uploaded_files = st.file_uploader(
     "Envie imagens ou PDF de manga",
@@ -204,205 +231,89 @@ if total_pages <= 0:
 
 output_pdf_pages_dir = ensure_dir(Path("output") / "_pdf_pages")
 
-translated_for_zip: list[tuple[int, Path]] = []
-global_page_counter = 0
-finished_pages = 0
+all_batch_files: list[tuple[str, bytes]] = []
+page_display_info: list[tuple[int, str]] = []
 
+global_page_counter = 0
 for file_idx, file_item in enumerate(inputs, start=1):
     file_kind = file_item["kind"]
     file_name = file_item["name"]
     file_content = file_item["content"]
-    hash_value = file_item["hash"]
 
     if file_kind == "pdf_error":
         global_page_counter += 1
-        finished_pages += 1
-        slot = st.empty()
-        job_key = page_job_key(hash_value, file_name, 1, translation_mode, source_lang, target_lang, ocr_lang)
-        st.session_state["translation_errors"][job_key] = {"message": file_item["error"]}
-        status_placeholder.warning(f"Nao foi possivel abrir o PDF {file_name}.")
-        render_page_error(slot, global_page_counter, file_item["error"])
-        overall_progress.progress(int((finished_pages / total_pages) * 100))
+        page_display_info.append((global_page_counter, file_name))
         continue
 
     if file_kind == "image":
-        page_number_in_file = 1
         global_page_counter += 1
-        job_key = page_job_key(
-            hash_value,
-            file_name,
-            page_number_in_file,
-            translation_mode,
-            source_lang,
-            target_lang,
-            ocr_lang,
-        )
-        slot = st.empty()
-
-        cached_result = normalize_cache_entry(st.session_state["translated_pages"].get(job_key))
-        cached_error = st.session_state["translation_errors"].get(job_key)
-
-        if cached_result is not None:
-            translated_path = Path(cached_result["translated_path"])
-            if translated_path.exists():
-                render_page_success(slot, global_page_counter, translated_path, job_key)
-                translated_for_zip.append((global_page_counter, translated_path))
-            else:
-                st.session_state["translated_pages"].pop(job_key, None)
-                st.session_state["translation_errors"][job_key] = {"message": "Arquivo traduzido nao encontrado no cache."}
-                render_page_error(slot, global_page_counter, "Arquivo traduzido nao encontrado no cache.")
-            finished_pages += 1
-            overall_progress.progress(int((finished_pages / total_pages) * 100))
-            continue
-
-        if cached_error is not None:
-            render_page_error(slot, global_page_counter, clean_text(cached_error.get("message")))
-            finished_pages += 1
-            overall_progress.progress(int((finished_pages / total_pages) * 100))
-            continue
-
-        status_placeholder.info(
-            f"Traduzindo pagina {global_page_counter} de {total_pages} · {translation_mode_label}..."
-        )
-
-        def update_progress(value: float, message: str, meta=None) -> None:
-            del message
-            del meta
-            local_value = float(max(0.0, min(1.0, value)))
-            absolute_progress = ((finished_pages + local_value) / total_pages) * 100.0
-            overall_progress.progress(int(max(0, min(100, round(absolute_progress)))))
-
-        try:
-            result = process_uploaded_image(
-                filename=file_name,
-                content=file_content,
-                translation_mode=translation_mode,
-                source_lang=source_lang,
-                target_lang=target_lang,
-                ocr_lang=ocr_lang,
-                translation_style=translation_style,
-                performance_mode=performance_mode,
-                debug_enabled=debug_enabled,
-                progress_callback=update_progress,
-            )
-            translated_path = Path(result.translated_image_path)
-            st.session_state["translated_pages"][job_key] = {"translated_path": str(translated_path)}
-            st.session_state["translation_errors"].pop(job_key, None)
-            render_page_success(slot, global_page_counter, translated_path, job_key)
-            translated_for_zip.append((global_page_counter, translated_path))
-            status_placeholder.success(f"Pagina {global_page_counter} concluida. ({translation_mode_label})")
-        except Exception as exc:
-            message = clean_text(exc) or f"Falha na pagina {global_page_counter}."
-            st.session_state["translation_errors"][job_key] = {"message": message}
-            render_page_error(slot, global_page_counter, message)
-            status_placeholder.warning(f"Nao foi possivel traduzir a pagina {global_page_counter}.")
-        finally:
-            finished_pages += 1
-            overall_progress.progress(int((finished_pages / total_pages) * 100))
+        all_batch_files.append((file_name, file_content))
+        page_display_info.append((global_page_counter, file_name))
         continue
 
-    # PDF
-    temp_pdf_dir = ensure_dir(output_pdf_pages_dir / f"pdf_{file_idx}_{hash_value}")
-    status_placeholder.info(f"Lendo PDF: {file_name}")
-
+    temp_pdf_dir = ensure_dir(output_pdf_pages_dir / f"pdf_{file_idx}_{file_item['hash']}")
     for page_number_in_file, total_pdf_pages, page_path in iter_pdf_pages(file_content, temp_pdf_dir, dpi=220):
         global_page_counter += 1
-        job_key = page_job_key(
-            hash_value,
-            file_name,
-            page_number_in_file,
-            translation_mode,
-            source_lang,
-            target_lang,
-            ocr_lang,
-        )
-        slot = st.empty()
-
-        cached_result = normalize_cache_entry(st.session_state["translated_pages"].get(job_key))
-        cached_error = st.session_state["translation_errors"].get(job_key)
-
-        if cached_result is not None:
-            translated_path = Path(cached_result["translated_path"])
-            if translated_path.exists():
-                render_page_success(slot, global_page_counter, translated_path, job_key)
-                translated_for_zip.append((global_page_counter, translated_path))
-            else:
-                st.session_state["translated_pages"].pop(job_key, None)
-                st.session_state["translation_errors"][job_key] = {"message": "Arquivo traduzido nao encontrado no cache."}
-                render_page_error(slot, global_page_counter, "Arquivo traduzido nao encontrado no cache.")
-            finished_pages += 1
-            overall_progress.progress(int((finished_pages / total_pages) * 100))
-            if page_path.exists():
-                page_path.unlink(missing_ok=True)
-            status_placeholder.success(f"Pagina {global_page_counter} concluida. ({translation_mode_label})")
-            continue
-
-        if cached_error is not None:
-            render_page_error(slot, global_page_counter, clean_text(cached_error.get("message")))
-            finished_pages += 1
-            overall_progress.progress(int((finished_pages / total_pages) * 100))
-            if page_path.exists():
-                page_path.unlink(missing_ok=True)
-            status_placeholder.warning(f"Nao foi possivel traduzir a pagina {global_page_counter}.")
-            continue
-
-        status_placeholder.info(f"Convertendo pagina {global_page_counter} de {total_pages}...")
         page_bytes = b""
         try:
             page_bytes = page_path.read_bytes()
-        except Exception as exc:
-            message = clean_text(exc) or f"Falha ao ler pagina {global_page_counter}."
-            st.session_state["translation_errors"][job_key] = {"message": message}
-            render_page_error(slot, global_page_counter, message)
-            finished_pages += 1
-            overall_progress.progress(int((finished_pages / total_pages) * 100))
-            if page_path.exists():
-                page_path.unlink(missing_ok=True)
-            continue
+        except Exception:
+            pass
+        if page_bytes:
+            page_name = f"{Path(file_name).stem}_page_{page_number_in_file:04d}.png"
+            all_batch_files.append((page_name, page_bytes))
+            page_display_info.append((global_page_counter, page_name))
+        if page_path.exists():
+            page_path.unlink(missing_ok=True)
 
-        status_placeholder.info(
-            f"Traduzindo pagina {global_page_counter} de {total_pages} · {translation_mode_label}..."
-        )
+if not all_batch_files:
+    status_placeholder.warning("Nenhum arquivo valido para processar.")
+    st.stop()
 
-        def update_progress(value: float, message: str, meta=None) -> None:
-            del message
-            del meta
-            local_value = float(max(0.0, min(1.0, value)))
-            absolute_progress = ((finished_pages + local_value) / total_pages) * 100.0
-            overall_progress.progress(int(max(0, min(100, round(absolute_progress)))))
+status_placeholder.info(f"Processando {len(all_batch_files)} paginas em lote...")
 
-        try:
-            result = process_uploaded_image(
-                filename=f"{Path(file_name).stem}_page_{page_number_in_file:04d}.png",
-                content=page_bytes,
-                translation_mode=translation_mode,
-                source_lang=source_lang,
-                target_lang=target_lang,
-                ocr_lang=ocr_lang,
-                translation_style=translation_style,
-                performance_mode=performance_mode,
-                debug_enabled=debug_enabled,
-                progress_callback=update_progress,
-            )
-            translated_path = Path(result.translated_image_path)
-            st.session_state["translated_pages"][job_key] = {"translated_path": str(translated_path)}
-            st.session_state["translation_errors"].pop(job_key, None)
-            render_page_success(slot, global_page_counter, translated_path, job_key)
-            translated_for_zip.append((global_page_counter, translated_path))
-            status_placeholder.success(f"Pagina {global_page_counter} concluida. ({translation_mode_label})")
-        except Exception as exc:
-            message = clean_text(exc) or f"Falha na pagina {global_page_counter}."
-            st.session_state["translation_errors"][job_key] = {"message": message}
-            render_page_error(slot, global_page_counter, message)
-            status_placeholder.warning(f"Nao foi possivel traduzir a pagina {global_page_counter}.")
-        finally:
-            page_bytes = b""
-            if page_path.exists():
-                page_path.unlink(missing_ok=True)
-            finished_pages += 1
-            overall_progress.progress(int((finished_pages / total_pages) * 100))
+def update_batch_progress(value: float, message: str, meta=None) -> None:
+    overall_progress.progress(int(max(0, min(100, round(value * 100)))))
 
-status_placeholder.success("Finalizado.")
+batch_results = process_batch(
+    files=all_batch_files,
+    translation_mode=translation_mode,
+    source_lang=source_lang,
+    target_lang=target_lang,
+    ocr_lang=ocr_lang,
+    translation_style=translation_style,
+    performance_mode=performance_mode,
+    debug_enabled=debug_enabled,
+    progress_callback=update_batch_progress,
+    min_font_size=min_font_size,
+    max_font_size=max_font_size,
+    line_spacing_ratio=line_spacing_ratio,
+    auto_font_resize=auto_font_resize,
+    center_text=center_text,
+    bold_text=bold_text,
+    text_color=text_color,
+)
+
+translated_for_zip: list[tuple[int, Path]] = []
+
+for idx, result in enumerate(batch_results):
+    page_num = idx + 1
+    slot = st.empty()
+    translated_path = Path(result.translated_image_path)
+    if translated_path.exists():
+        render_page_success(slot, page_num, translated_path, f"batch_{page_num}")
+        translated_for_zip.append((page_num, translated_path))
+    else:
+        render_page_error(slot, page_num, "Arquivo traduzido nao encontrado.")
+
+for err_idx in range(len(batch_results), len(all_batch_files)):
+    page_num = err_idx + 1
+    slot = st.empty()
+    render_page_error(slot, page_num, "Pagina nao processada.")
+
+status_placeholder.success(
+    f"Finalizado. {len(batch_results)}/{len(all_batch_files)} paginas traduzidas."
+)
 
 if translated_for_zip:
     ordered = sorted(translated_for_zip, key=lambda item: item[0])

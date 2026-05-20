@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 import cv2
@@ -9,22 +10,30 @@ from PIL import ImageDraw, ImageFont
 
 from app.config import AppConfig
 from app.types import SpeechBubble
-from app.utils import cv2_to_pil, pil_to_cv2, safe_text
+from app.utils import cv2_to_pil, pil_to_cv2, safe_text, write_image_cv2
 
 
 class TextRenderer:
     """
-    Renderiza o texto traduzido dentro do balão com:
-    - área segura centralizada
-    - uso da máscara do balão quando disponível
+    Renderiza o texto traduzido dentro do balao com:
+    - area segura centralizada
+    - uso da mascara do balao quando disponivel
     - quebra de linha inteligente
-    - redução automática da fonte
-    - centralização horizontal e vertical
-    - fallback com reticências quando o texto ainda for grande demais
+    - reducao automatica da fonte
+    - centralizacao horizontal e vertical
+    - fallback com reticencias quando o texto ainda for grande demais
+    - verificacao de mascara de limpeza antes de renderizar
+    - contencao total do texto dentro do balao
     """
 
     def __init__(self, config: AppConfig):
         self.config = config
+        self.debug_dir: Path | None = None
+        self.last_font_size: int = 0
+        self.last_line_count: int = 0
+        self.last_text_width: int = 0
+        self.last_text_height: int = 0
+        self.last_shrink_reason: str = ""
 
     def render(self, image: np.ndarray, bubble: SpeechBubble) -> np.ndarray:
         text = safe_text(getattr(bubble, "translated_text", ""))
@@ -76,7 +85,25 @@ class TextRenderer:
             bubble.processing_notes.append("largura final do texto excedeu o balao")
             return image
 
-        current_y = y + max(0, (h - total_height) // 2)
+        center_text = bool(getattr(self.config, "center_text", True))
+        if center_text:
+            current_y = y + max(0, (h - total_height) // 2)
+        else:
+            current_y = y
+
+        widest = max(self._text_width(draw, line, font) for line in lines)
+
+        self.last_font_size = getattr(font, "size", 0) if hasattr(font, "size") else 0
+        self.last_line_count = len(lines)
+        self.last_text_width = widest
+        self.last_text_height = total_height
+
+        print(f"[RENDERER] Bubble {bubble.id}: font_size={self.last_font_size}px, "
+              f"lines={self.last_line_count}, "
+              f"text={self.last_text_width}x{self.last_text_height}px, "
+              f"area={w}x{h}px")
+        if self.last_shrink_reason:
+            print(f"[RENDERER] Bubble {bubble.id}: motivo reducao: {self.last_shrink_reason}")
 
         for line in lines:
             line_bbox = draw.textbbox((0, 0), line, font=font)
@@ -87,7 +114,10 @@ class TextRenderer:
                 bubble.processing_notes.append("linha ultrapassaria area segura; renderizacao interrompida")
                 return image
 
-            line_x = x + max(0, (w - line_width) // 2)
+            if center_text:
+                line_x = x + max(0, (w - line_width) // 2)
+            else:
+                line_x = x
 
             if bool(getattr(self.config, "draw_text_outline", False)):
                 draw.text(
@@ -108,17 +138,104 @@ class TextRenderer:
 
             current_y += line_height
 
-        return pil_to_cv2(pil_image)
+        result = pil_to_cv2(pil_image)
+
+        if getattr(bubble, "mask", None) is not None and bubble.mask.size > 0:
+            result = self._contain_render_inside_mask(result, image, bubble)
+
+        self._save_debug_images(bubble, image, result, x, y, w, h, lines, font, draw)
+
+        return result
+
+    def _save_debug_images(
+        self,
+        bubble: SpeechBubble,
+        original: np.ndarray,
+        rendered: np.ndarray,
+        x: int,
+        y: int,
+        w: int,
+        h: int,
+        lines: list[str],
+        font,
+        draw: ImageDraw.ImageDraw,
+    ) -> None:
+        if self.debug_dir is None:
+            return
+
+        debug_layout = rendered.copy()
+        cv2.rectangle(debug_layout, (x, y), (x + w, y + h), (0, 200, 0), 1)
+        cv2.rectangle(debug_layout, (x - 2, y - 2), (x + w + 2, y + h + 2), (0, 0, 255), 1)
+
+        text_bottom = y
+        for line in lines:
+            line_bbox = draw.textbbox((0, 0), line, font=font)
+            lh = line_bbox[3] - line_bbox[1]
+            text_bottom += lh
+        cv2.line(debug_layout, (x, text_bottom), (x + w, text_bottom), (255, 0, 0), 1)
+
+        write_image_cv2(Path(self.debug_dir) / "debug_text_layout.png", debug_layout)
+
+        debug_font = rendered.copy()
+        font_info = f"font:{self.last_font_size}px lines:{self.last_line_count} size:{self.last_text_width}x{self.last_text_height}"
+        cv2.putText(
+            debug_font,
+            font_info,
+            (max(5, x), max(15, y - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.4,
+            (0, 0, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        write_image_cv2(Path(self.debug_dir) / "debug_font_size.png", debug_font)
+
+        debug_box = original.copy()
+        cv2.rectangle(debug_box, (bubble.bbox.x1, bubble.bbox.y1), (bubble.bbox.x2, bubble.bbox.y2), (0, 180, 0), 2)
+        cv2.rectangle(debug_box, (x, y), (x + w, y + h), (0, 0, 255), 1)
+        write_image_cv2(Path(self.debug_dir) / "debug_text_box.png", debug_box)
+
+    def _contain_render_inside_mask(
+        self,
+        rendered: np.ndarray,
+        original: np.ndarray,
+        bubble: SpeechBubble,
+    ) -> np.ndarray:
+        """Ensure rendered text stays inside the bubble mask."""
+        mask = bubble.mask
+        if mask is None or mask.size == 0:
+            return rendered
+
+        h, w = rendered.shape[:2]
+        mask_h, mask_w = mask.shape[:2]
+
+        if mask_h != h or mask_w != w:
+            return rendered
+
+        inner_mask = (mask > 0).astype(np.uint8)
+        erode_radius = max(1, int(getattr(self.config, "bubble_erode_px", 8)) // 2)
+        kernel_size = erode_radius * 2 + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        inner_mask = cv2.erode(inner_mask, kernel, iterations=1)
+
+        outside_mask = (inner_mask == 0).astype(np.uint8)
+
+        if cv2.countNonZero(outside_mask) == 0:
+            return rendered
+
+        result = rendered.copy()
+        result[outside_mask > 0] = original[outside_mask > 0]
+        return result
 
     def get_safe_text_rect(self, bubble: SpeechBubble, image_shape) -> tuple[int, int, int, int] | None:
         """
-        Retorna uma área central segura para o texto.
+        Retorna uma area central segura para o texto.
 
         Importante:
-        Para balões ovais ou irregulares, usar apenas o bounding box pode deixar
-        o texto sair visualmente do balão nos cantos. Por isso, quando existe
-        máscara, esta função tenta encontrar um retângulo central com alta
-        cobertura dentro da máscara.
+        Para baloes ovais ou irregulares, usar apenas o bounding box pode deixar
+        o texto sair visualmente do balao nos cantos. Por isso, quando existe
+        mascara, esta funcao tenta encontrar um retangulo central com alta
+        cobertura dentro da mascara.
         """
 
         image_h, image_w = image_shape[:2]
@@ -201,8 +318,6 @@ class TextRenderer:
         center_x = x + int(max_loc[0])
         center_y = y + int(max_loc[1])
 
-        # Escalas conservadoras. Em balões ovais, uma área central menor
-        # é mais confiável do que usar o bbox inteiro.
         scale_candidates = [
             (0.78, 0.64),
             (0.72, 0.70),
@@ -272,7 +387,6 @@ class TextRenderer:
 
             coverage = cv2.countNonZero(roi) / float(w * h)
 
-            # 0.96 evita usar cantos fora de balões ovais/irregulares.
             if coverage >= 0.96:
                 return x, y, w, h
 
@@ -360,19 +474,41 @@ class TextRenderer:
         min_font_size, _ = self._scaled_font_bounds()
         step = max(1, int(getattr(self.config, "font_shrink_step", 1)))
         effective_max_font = self._effective_max_font_size(bubble, max_width, max_height)
+        auto_resize = bool(getattr(self.config, "auto_font_resize", True))
 
         spacing_candidates = self._spacing_candidates()
         max_attempts = int(getattr(self.config, "max_render_font_attempts", 0) or 0)
         attempts = 0
+        self.last_shrink_reason = ""
+
+        if not auto_resize:
+            font = self._load_font(effective_max_font)
+            target_width = max_width
+            lines = self._wrap_text(draw, text, font, target_width)
+            if lines:
+                lines = self._balance_lines(draw, lines, font, target_width)
+                spacing_ratio = spacing_candidates[0] if spacing_candidates else 1.12
+                line_height = self._line_height(draw, font, spacing_ratio)
+                total_height = line_height * len(lines)
+                widest = max(self._text_width(draw, line, font) for line in lines)
+
+                if widest <= max_width and total_height <= max_height:
+                    return font, lines, line_height, total_height
+
+                self.last_shrink_reason = "auto_font_resize=False, texto nao cabe"
+                return None, [], 0, 0
+
+            self.last_shrink_reason = "auto_font_resize=False, wrap falhou"
+            return None, [], 0, 0
 
         for size in range(effective_max_font, min_font_size - 1, -step):
             attempts += 1
             if max_attempts and attempts > max_attempts:
+                self.last_shrink_reason = f"max tentativas ({max_attempts}) atingido"
                 break
 
             font = self._load_font(size)
 
-            # Testa múltiplas larguras-alvo para melhorar a centralização visual.
             target_width_candidates = (
                 max_width,
                 int(max_width * 0.92),
@@ -395,6 +531,8 @@ class TextRenderer:
                     widest = max(self._text_width(draw, line, font) for line in lines)
 
                     if widest <= max_width and total_height <= max_height:
+                        if size < effective_max_font:
+                            self.last_shrink_reason = f"reduzido de {effective_max_font} para {size}px"
                         return font, lines, line_height, total_height
 
                     clipped_lines = self._clip_lines_to_height(
@@ -411,8 +549,11 @@ class TextRenderer:
                         widest = max(self._text_width(draw, line, font) for line in clipped_lines)
 
                         if widest <= max_width and total_height <= max_height:
+                            if size < effective_max_font:
+                                self.last_shrink_reason = f"reduzido de {effective_max_font} para {size}px + clip"
                             return font, clipped_lines, line_height, total_height
 
+        self.last_shrink_reason = f"nenhum tamanho coube (min={min_font_size}px, max={effective_max_font}px)"
         return None, [], 0, 0
 
     def _effective_max_font_size(self, bubble: SpeechBubble, max_width: int, max_height: int) -> int:
@@ -436,16 +577,35 @@ class TextRenderer:
         scaled_cap = max(1, int(round(cap * scale)))
         return max(scaled_min, min(scaled_max, scaled_cap))
 
+    def _load_font(self, size: int):
+        bold = bool(getattr(self.config, "bold_text", False))
+        return self._load_font_cached(size, bold)
+
     @staticmethod
-    @lru_cache(maxsize=96)
-    def _load_font(size: int):
-        for font_name in (
-            "arial.ttf",
-            "Arial.ttf",
-            "DejaVuSans.ttf",
-            "DejaVuSans-Bold.ttf",
-            "LiberationSans-Regular.ttf",
-        ):
+    @lru_cache(maxsize=192)
+    def _load_font_cached(size: int, bold: bool = False):
+        if bold:
+            font_candidates = (
+                "arialbd.ttf",
+                "Arial Bold.ttf",
+                "Arial-Bold.ttf",
+                "DejaVuSans-Bold.ttf",
+                "LiberationSans-Bold.ttf",
+                "arial.ttf",
+                "Arial.ttf",
+                "DejaVuSans.ttf",
+                "LiberationSans-Regular.ttf",
+            )
+        else:
+            font_candidates = (
+                "arial.ttf",
+                "Arial.ttf",
+                "DejaVuSans.ttf",
+                "DejaVuSans-Bold.ttf",
+                "LiberationSans-Regular.ttf",
+            )
+
+        for font_name in font_candidates:
             try:
                 return ImageFont.truetype(font_name, size=size)
             except OSError:
@@ -525,11 +685,6 @@ class TextRenderer:
         font,
         max_width: int,
     ) -> list[str]:
-        """
-        Tenta evitar primeira linha muito comprida e última linha muito curta.
-        Isso melhora o visual centralizado dentro do balão.
-        """
-
         if len(lines) < 2:
             return lines
 

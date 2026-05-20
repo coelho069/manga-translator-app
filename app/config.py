@@ -53,5 +53,13 @@ class AppConfig:
     draw_text_outline: bool = False
     text_color: tuple[int, int, int] = (0, 0, 0)
     outline_color: tuple[int, int, int] = (255, 255, 255)
+    auto_font_resize: bool = True
+    center_text: bool = True
+    bold_text: bool = False
+    cleanup_feather_px: int = 2
+    residual_dark_threshold: int = 100
+    residual_min_component_area: int = 6
+    residual_max_component_ratio: float = 0.04
+    residual_max_ratio: float = 0.025
     debug_enabled: bool = False
     debug_dir: Path | None = None

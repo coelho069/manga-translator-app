@@ -16,13 +16,20 @@ class BubbleCleaner:
         self.last_dark_mask: np.ndarray | None = None
         self.last_cleanup_mask: np.ndarray | None = None
         self.last_cleaned: bool = False
+        self.last_residual_dark_pixels: int = 0
+        self.last_residual_ratio: float = 0.0
+        self.last_block_reason: str = ""
+        self.last_before_image: np.ndarray | None = None
+        self.last_after_image: np.ndarray | None = None
 
     def clean(self, image: np.ndarray, bubble: SpeechBubble) -> np.ndarray:
         self._reset_debug(image)
         bubble.cleanup_success = False
+        self.last_before_image = image.copy()
 
         if image is None or image.size == 0:
             self._add_note(bubble, "imagem invalida para limpeza")
+            self.last_block_reason = "imagem invalida"
             return image
 
         inner_mask = self._inner_bubble_mask(
@@ -35,10 +42,8 @@ class BubbleCleaner:
         if cv2.countNonZero(inner_mask) == 0:
             self._add_note(bubble, "mascara interna vazia")
             self.last_cleaned = False
-            print(f"[CLEANER] Bubble {bubble.id}: OCR mask pixels = 0")
-            print(f"[CLEANER] Bubble {bubble.id}: dark mask pixels = 0")
-            print(f"[CLEANER] Bubble {bubble.id}: final mask pixels = 0")
-            print(f"[CLEANER] Bubble {bubble.id}: cleanup_success = {bubble.cleanup_success}")
+            self.last_block_reason = "mascara interna vazia"
+            self._log_cleanup_status(bubble, 0, 0, 0)
             return image
 
         ocr_mask = self._ocr_text_mask(bubble, image.shape[:2])
@@ -67,15 +72,13 @@ class BubbleCleaner:
         self.last_cleanup_mask = final_mask.copy()
         final_pixels = cv2.countNonZero(final_mask)
 
-        print(f"[CLEANER] Bubble {bubble.id}: OCR mask pixels = {ocr_pixels}")
-        print(f"[CLEANER] Bubble {bubble.id}: dark mask pixels = {dark_pixels}")
-        print(f"[CLEANER] Bubble {bubble.id}: final mask pixels = {final_pixels}")
+        self._log_cleanup_status(bubble, ocr_pixels, dark_pixels, final_pixels)
 
         if final_pixels == 0:
             self.last_cleaned = False
             bubble.cleanup_success = False
+            self.last_block_reason = "sem mascara final"
             self._add_note(bubble, "falha na limpeza: sem mascara final")
-            print(f"[CLEANER] Bubble {bubble.id}: cleanup_success = {bubble.cleanup_success}")
             return image
 
         mode = safe_text(getattr(self.config, "cleaner_mode", "white_fill")).lower()
@@ -83,22 +86,41 @@ class BubbleCleaner:
             cleaned = cv2.inpaint(
                 image,
                 final_mask,
-                int(max(1, getattr(self.config, "inpaint_radius", 3))),
+                int(max(1, getattr(self.config, "inpaint_radius", 5))),
                 cv2.INPAINT_TELEA,
             )
         else:
             cleaned = self._white_fill(image, final_mask, inner_mask)
 
+        self.last_after_image = cleaned.copy()
+
+        residual_ok, residual_count, residual_ratio = self._verify_cleanup(
+            cleaned, inner_mask, bubble
+        )
+
+        if not residual_ok:
+            self.last_cleaned = False
+            bubble.cleanup_success = False
+            self.last_block_reason = f"texto residual detectado: {residual_count} pixels ({residual_ratio:.1%})"
+            self._add_note(bubble, f"limpeza falhou: texto residual {residual_count} pixels ({residual_ratio:.1%})")
+            print(f"[CLEANER] Bubble {bubble.id}: BLOQUEADO - texto residual {residual_count} pixels ({residual_ratio:.1%})")
+            return image
+
         self.last_cleaned = True
         bubble.cleanup_success = True
-        print(f"[CLEANER] Bubble {bubble.id}: cleanup_success = {bubble.cleanup_success}")
+        self.last_block_reason = ""
+        self.last_residual_dark_pixels = residual_count
+        self.last_residual_ratio = residual_ratio
+        print(f"[CLEANER] Bubble {bubble.id}: limpeza OK - residual {residual_count} pixels ({residual_ratio:.1%})")
         return cleaned
 
     def force_clean_bubble_inner_area(self, image: np.ndarray, bubble: SpeechBubble) -> np.ndarray:
         self._reset_debug(image)
         bubble.cleanup_success = False
+        self.last_before_image = image.copy()
 
         if image is None or image.size == 0:
+            self.last_block_reason = "imagem invalida"
             return image
 
         inner_mask = self._inner_bubble_mask(
@@ -117,13 +139,88 @@ class BubbleCleaner:
         if cv2.countNonZero(inner_mask) == 0:
             self.last_cleaned = False
             bubble.cleanup_success = False
+            self.last_block_reason = "mascara interna vazia no fallback"
             return image
 
         cleaned = self._white_fill(image, inner_mask, inner_mask)
+        self.last_after_image = cleaned.copy()
+
+        residual_ok, residual_count, residual_ratio = self._verify_cleanup(
+            cleaned, inner_mask, bubble
+        )
+
+        if not residual_ok:
+            self.last_cleaned = False
+            bubble.cleanup_success = False
+            self.last_block_reason = f"fallback: texto residual {residual_count} pixels ({residual_ratio:.1%})"
+            self._add_note(bubble, f"fallback falhou: texto residual {residual_count} pixels")
+            return image
+
         self.last_cleaned = True
         bubble.cleanup_success = True
+        self.last_block_reason = ""
+        self.last_residual_dark_pixels = residual_count
+        self.last_residual_ratio = residual_ratio
         self._add_note(bubble, "fallback forcado: limpeza branca interna aplicada")
         return cleaned
+
+    def _verify_cleanup(
+        self,
+        cleaned_image: np.ndarray,
+        inner_mask: np.ndarray,
+        bubble: SpeechBubble,
+    ) -> tuple[bool, int, float]:
+        """Verify that the cleaned image has no significant residual text."""
+        coords = cv2.findNonZero(inner_mask)
+        if coords is None:
+            return True, 0, 0.0
+
+        x, y, w, h = cv2.boundingRect(coords)
+        crop = cleaned_image[y : y + h, x : x + w]
+        crop_inner = inner_mask[y : y + h, x : x + w]
+
+        if crop.size == 0 or crop_inner.size == 0:
+            return True, 0, 0.0
+
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        threshold = int(getattr(self.config, "residual_dark_threshold", 100))
+        dark_pixels = np.zeros_like(gray, dtype=np.uint8)
+        dark_pixels[gray < threshold] = 255
+        dark_pixels = cv2.bitwise_and(dark_pixels, crop_inner)
+
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            dark_pixels, connectivity=8
+        )
+
+        inner_area = max(1, cv2.countNonZero(crop_inner))
+        residual_count = 0
+        min_component_area = int(getattr(self.config, "residual_min_component_area", 6))
+        max_component_ratio = float(getattr(self.config, "residual_max_component_ratio", 0.04))
+        max_component_area = max(min_component_area, int(inner_area * max_component_ratio))
+
+        bubble_w = max(1, bubble.bbox.width)
+        bubble_h = max(1, bubble.bbox.height)
+        max_w = int(bubble_w * 0.85)
+        max_h = int(bubble_h * 0.85)
+
+        for label_idx in range(1, num_labels):
+            area = int(stats[label_idx, cv2.CC_STAT_AREA])
+            cw = int(stats[label_idx, cv2.CC_STAT_WIDTH])
+            ch = int(stats[label_idx, cv2.CC_STAT_HEIGHT])
+
+            if area < min_component_area:
+                continue
+            if area > max_component_area:
+                continue
+            if cw >= max_w or ch >= max_h:
+                continue
+
+            residual_count += area
+
+        residual_ratio = residual_count / inner_area
+        max_ratio = float(getattr(self.config, "residual_max_ratio", 0.025))
+
+        return residual_ratio <= max_ratio, residual_count, residual_ratio
 
     def _reset_debug(self, image: np.ndarray | None) -> None:
         shape = image.shape[:2] if image is not None and image.size else (1, 1)
@@ -133,6 +230,11 @@ class BubbleCleaner:
         self.last_dark_mask = empty.copy()
         self.last_cleanup_mask = empty.copy()
         self.last_cleaned = False
+        self.last_residual_dark_pixels = 0
+        self.last_residual_ratio = 0.0
+        self.last_block_reason = ""
+        self.last_before_image = None
+        self.last_after_image = None
 
     def _inner_bubble_mask(
         self,
@@ -192,8 +294,12 @@ class BubbleCleaner:
         if cv2.countNonZero(mask) == 0:
             return mask
 
-        mask = self._dilate(mask, self._mode_radius(int(getattr(self.config, "text_mask_dilate_px", 15))))
-        mask = self._close(mask, self._mode_radius(int(getattr(self.config, "cleanup_morph_close_px", 5))))
+        dilate_radius = int(getattr(self.config, "text_mask_dilate_px", 15))
+        close_radius = int(getattr(self.config, "cleanup_morph_close_px", 5))
+
+        mask = self._dilate(mask, self._mode_radius(dilate_radius))
+        mask = self._close(mask, self._mode_radius(close_radius))
+        mask = self._dilate(mask, self._mode_radius(max(2, dilate_radius // 3)))
         return mask
 
     def _dark_text_mask(
@@ -225,8 +331,12 @@ class BubbleCleaner:
         if cv2.countNonZero(filtered_crop) == 0:
             return np.zeros(inner_mask.shape, dtype=np.uint8)
 
-        filtered_crop = self._dilate(filtered_crop, self._mode_radius(int(getattr(self.config, "text_mask_dilate_px", 15)) // 2))
-        filtered_crop = self._close(filtered_crop, self._mode_radius(int(getattr(self.config, "cleanup_morph_close_px", 5))))
+        dilate_radius = int(getattr(self.config, "text_mask_dilate_px", 15)) // 2
+        close_radius = int(getattr(self.config, "cleanup_morph_close_px", 5))
+
+        filtered_crop = self._dilate(filtered_crop, self._mode_radius(dilate_radius))
+        filtered_crop = self._close(filtered_crop, self._mode_radius(close_radius))
+        filtered_crop = self._dilate(filtered_crop, self._mode_radius(max(2, dilate_radius // 3)))
 
         full = np.zeros(inner_mask.shape, dtype=np.uint8)
         full[y : y + h, x : x + w] = filtered_crop
@@ -252,11 +362,9 @@ class BubbleCleaner:
         max_h = int(max(4, bubble_h * 0.90))
 
         for label_idx in range(1, num_labels):
-            x = int(stats[label_idx, cv2.CC_STAT_LEFT])
-            y = int(stats[label_idx, cv2.CC_STAT_TOP])
+            area = int(stats[label_idx, cv2.CC_STAT_AREA])
             w = int(stats[label_idx, cv2.CC_STAT_WIDTH])
             h = int(stats[label_idx, cv2.CC_STAT_HEIGHT])
-            area = int(stats[label_idx, cv2.CC_STAT_AREA])
 
             if area < min_area:
                 continue
@@ -290,6 +398,7 @@ class BubbleCleaner:
         mask = text_mask.copy()
         mask = self._dilate(mask, self._mode_radius(int(getattr(self.config, "cleanup_extra_dilate_px", 5))))
         mask = self._close(mask, self._mode_radius(int(getattr(self.config, "cleanup_morph_close_px", 5))))
+        mask = self._dilate(mask, self._mode_radius(3))
         mask = cv2.bitwise_and(mask, inner_mask)
         return mask
 
@@ -362,6 +471,32 @@ class BubbleCleaner:
             fill_color = (255, 255, 255)
 
         result[final_mask > 0] = fill_color
+
+        mask_coords = cv2.findNonZero(final_mask)
+        if mask_coords is not None:
+            mx, my, mw, mh = cv2.boundingRect(mask_coords)
+            feather_radius = max(1, int(getattr(self.config, "cleanup_feather_px", 2)))
+            for dy in range(-feather_radius, feather_radius + 1):
+                for dx in range(-feather_radius, feather_radius + 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    shifted_mask = np.zeros_like(final_mask)
+                    src_region = final_mask[
+                        max(0, my + dy) : min(final_mask.shape[0], my + mh + dy),
+                        max(0, mx + dx) : min(final_mask.shape[1], mx + mw + dx),
+                    ]
+                    dst_y = max(0, my + dy)
+                    dst_x = max(0, mx + dx)
+                    dst_h = min(final_mask.shape[0], my + mh + dy) - dst_y
+                    dst_w = min(final_mask.shape[1], mx + mw + dx) - dst_x
+                    if dst_h > 0 and dst_w > 0:
+                        shifted_mask[dst_y : dst_y + dst_h, dst_x : dst_x + dst_w] = src_region[:dst_h, :dst_w]
+
+                    border = cv2.subtract(shifted_mask, final_mask)
+                    border_inner = cv2.bitwise_and(border, inner_mask)
+                    if cv2.countNonZero(border_inner) > 0:
+                        result[border_inner > 0] = fill_color
+
         return result
 
     def _mode_radius(self, radius: int) -> int:
@@ -389,6 +524,20 @@ class BubbleCleaner:
         if radius <= 0:
             return mask
         return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._kernel(radius))
+
+    def _log_cleanup_status(
+        self,
+        bubble: SpeechBubble,
+        ocr_pixels: int,
+        dark_pixels: int,
+        final_pixels: int,
+    ) -> None:
+        inner_pixels = cv2.countNonZero(self.last_inner_mask) if self.last_inner_mask is not None else 0
+        print(f"[CLEANER] Bubble {bubble.id}: inner mask pixels = {inner_pixels}")
+        print(f"[CLEANER] Bubble {bubble.id}: OCR mask pixels = {ocr_pixels}")
+        print(f"[CLEANER] Bubble {bubble.id}: dark mask pixels = {dark_pixels}")
+        print(f"[CLEANER] Bubble {bubble.id}: final mask pixels = {final_pixels}")
+        print(f"[CLEANER] Bubble {bubble.id}: cleanup_success = {bubble.cleanup_success}")
 
     @staticmethod
     def _add_note(bubble: SpeechBubble, message: str) -> None:

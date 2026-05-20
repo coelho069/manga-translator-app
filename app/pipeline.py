@@ -51,8 +51,9 @@ class MangaTranslatorPipeline:
         output_dir = ensure_dir(output_dir or self.config.output_dir)
 
         self.debug_dir = None
-        if self.config.debug_enabled or self.config.debug_dir is not None:
+        if self.config.debug_enabled:
             self.debug_dir = ensure_dir(self.config.debug_dir or Path(output_dir) / "debug")
+        self.renderer.debug_dir = self.debug_dir
 
         flow_report_path: Path | None = None
         if self.debug_dir is not None:
@@ -147,6 +148,9 @@ class MangaTranslatorPipeline:
         clean_elapsed = 0.0
         render_elapsed = 0.0
 
+        if self.debug_dir is not None:
+            self._save_debug_image("debug_before_cleanup.png", work_image)
+
         for index, bubble in enumerate(bubbles):
             if not (bubble.source_text and bubble.translated_text):
                 continue
@@ -163,6 +167,7 @@ class MangaTranslatorPipeline:
             except Exception as exc:
                 bubble.processing_notes.append(f"erro na limpeza: {exc}")
                 record["skipped_reason"] = f"erro na limpeza: {exc}"
+                self.last_block_reason = str(exc)
             clean_elapsed += self._elapsed(clean_start)
 
             if not self.cleaner.last_cleaned and bool(getattr(self.config, "force_clean_on_failed_mask", True)):
@@ -175,22 +180,53 @@ class MangaTranslatorPipeline:
                         record["skipped_reason"] = f"erro no fallback de limpeza: {exc}"
                 clean_elapsed += self._elapsed(fallback_start)
 
-            self._save_bubble_debug(bubble)
+            if self.debug_dir is not None:
+                self._save_bubble_debug(bubble)
 
             if self.cleaner.last_cleaned:
                 bubble.cleanup_success = True
                 cleaned_bubble_ids.add(bubble.id)
+                print(f"[PIPELINE] Bubble {bubble.id}: limpeza OK - renderizacao PERMITIDA")
+                if self.debug_dir is not None:
+                    print(f"[PIPELINE] Bubble {bubble.id}: residual dark pixels = {self.cleaner.last_residual_dark_pixels}")
+                    print(f"[PIPELINE] Bubble {bubble.id}: residual ratio = {self.cleaner.last_residual_ratio:.1%}")
+                    self._save_debug_image(
+                        f"debug_bubble_{bubble.id}_render_allowed.png", work_image
+                    )
             else:
-                bubble.processing_notes.append("limpeza falhou; renderizacao ignorada para evitar sobreposicao")
+                block_reason = self.cleaner.last_block_reason or "limpeza falhou"
+                bubble.processing_notes.append(f"limpeza falhou: {block_reason}; traducao nao renderizada")
                 if not record["skipped_reason"]:
-                    record["skipped_reason"] = "limpeza falhou"
+                    record["skipped_reason"] = f"limpeza falhou: {block_reason}"
+                print(f"[PIPELINE] Bubble {bubble.id}: BLOQUEADO - {block_reason}")
+                print(f"[PIPELINE] Bubble {bubble.id}: traducao NAO renderizada")
+                if self.debug_dir is not None:
+                    self._save_debug_image(
+                        f"debug_bubble_{bubble.id}_render_blocked.png", work_image
+                    )
                 continue
 
             self._progress(progress_callback, 0.80 + bubble_progress * 0.14, "inserindo traducao")
             render_start = perf_counter()
+
+            if bubble.id not in cleaned_bubble_ids:
+                print(f"[PIPELINE] Bubble {bubble.id}: BLOQUEADO - id nao esta em cleaned_bubble_ids")
+                bubble.processing_notes.append("renderizacao ignorada: id nao esta em cleaned_bubble_ids")
+                if not record["skipped_reason"]:
+                    record["skipped_reason"] = "id nao esta em cleaned_bubble_ids"
+                continue
+
+            if not bubble.cleanup_success:
+                print(f"[PIPELINE] Bubble {bubble.id}: BLOQUEADO - cleanup_success=False")
+                bubble.processing_notes.append("renderizacao ignorada: cleanup_success=False")
+                if not record["skipped_reason"]:
+                    record["skipped_reason"] = "cleanup_success=False"
+                continue
+
             try:
                 work_image = self.renderer.render(work_image, bubble)
                 record["render_ran"] = True
+                print(f"[PIPELINE] Bubble {bubble.id}: traducao renderizada com sucesso")
             except Exception as exc:
                 if not record["skipped_reason"]:
                     record["skipped_reason"] = f"erro na renderizacao: {exc}"
@@ -198,20 +234,22 @@ class MangaTranslatorPipeline:
             render_elapsed += self._elapsed(render_start)
 
         timings["clean"] = round(clean_elapsed, 4)
-        self._save_debug_image("debug_after_cleanup.png", work_image)
-        self._save_debug_image("after_cleanup.png", work_image)
+        if self.debug_dir is not None:
+            self._save_debug_image("debug_after_cleanup.png", work_image)
+            self._save_debug_image("after_cleanup.png", work_image)
         timings["render"] = round(render_elapsed, 4)
 
         if not bubbles:
             self._progress(progress_callback, 0.80, "nenhum balao detectado")
 
         self._progress(progress_callback, 0.96, "finalizando")
-        self._save_debug_image("debug_final_rendered.png", work_image)
-        self._save_debug_image("final.png", work_image)
-        self._save_debug_image("final_with_bbox.png", self._draw_debug_bboxes(work_image, bubbles))
+        if self.debug_dir is not None:
+            self._save_debug_image("debug_final_rendered.png", work_image)
+            self._save_debug_image("final.png", work_image)
+            self._save_debug_image("final_with_bbox.png", self._draw_debug_bboxes(work_image, bubbles))
 
         flow_report_list = self._finalize_flow_report(bubbles, flow_report)
-        if flow_report_path is not None:
+        if flow_report_path is not None and self.debug_dir is not None:
             self._save_flow_report(flow_report_path, flow_report_list)
 
         detected_count = len(bubbles)
@@ -226,6 +264,8 @@ class MangaTranslatorPipeline:
         timings["save"] = self._elapsed(step_start)
         timings["total"] = self._elapsed(total_start)
         self._progress(progress_callback, 1.0, "finalizado")
+
+        self._print_summary(bubbles, cleaned_bubble_ids, flow_report_list)
 
         return AppResult(
             original_image_path=original_image_path,
@@ -257,6 +297,27 @@ class MangaTranslatorPipeline:
                 "debug_dir": str(self.debug_dir) if self.debug_dir is not None else "",
             },
         )
+
+    def _print_summary(
+        self,
+        bubbles: list[SpeechBubble],
+        cleaned_bubble_ids: set[int],
+        flow_report_list: list[dict],
+    ) -> None:
+        print("\n" + "=" * 60)
+        print("[RESUMO] Resultado da traducao")
+        print("=" * 60)
+        print(f"  Baloes detectados: {len(bubbles)}")
+        print(f"  Limpezas bem-sucedidas: {len(cleaned_bubble_ids)}")
+        print(f"  Renderizacoes: {sum(1 for r in flow_report_list if r.get('render_ran'))}")
+
+        blocked = [r for r in flow_report_list if r.get("skipped_reason")]
+        if blocked:
+            print(f"  Baloes bloqueados: {len(blocked)}")
+            for r in blocked:
+                print(f"    - Bubble {r['id']}: {r['skipped_reason']}")
+
+        print("=" * 60 + "\n")
 
     @classmethod
     def _progress(cls, callback, value: float, message: str) -> None:
@@ -379,6 +440,15 @@ class MangaTranslatorPipeline:
         self._save_debug_image(f"bubble_{bubble.id}_dark_text_mask.png", self.cleaner.last_dark_mask)
         self._save_debug_image(f"bubble_{bubble.id}_ocr_mask.png", self.cleaner.last_ocr_mask)
         self._save_debug_image(f"bubble_{bubble.id}_final_cleanup_mask.png", self.cleaner.last_cleanup_mask)
+
+        self._save_debug_image(
+            f"bubble_{bubble.id}_debug_before_cleanup.png",
+            self.cleaner.last_before_image,
+        )
+        self._save_debug_image(
+            f"bubble_{bubble.id}_debug_after_cleanup.png",
+            self.cleaner.last_after_image,
+        )
 
     def _save_debug_image(self, filename: str, image: np.ndarray | None) -> None:
         if self.debug_dir is None or image is None or image.size == 0:

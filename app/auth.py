@@ -13,8 +13,10 @@ from app.key_manager import (
     get_key_status,
     get_remaining_time,
     is_admin_key,
+    is_key_expired,
     list_admin_keys,
     list_keys,
+    load_keys,
     remove_key,
     reset_key_redemption,
     validate_key_for_ip,
@@ -170,12 +172,24 @@ def render_key_panel() -> None:
                 expiration_days=expiration_days,
             )
             st.session_state["last_generated_key"] = new_key
-            st.success(f"Nova key: {new_key}")
+            print(f"[KEY] Gerada: {new_key}")
+            print(f"[KEY] expires_at: {get_key_status(new_key).get('expires_at')}")
+            print(f"[KEY] keys carregadas: {len(list_keys())}")
             _rerun()
 
         last_generated_key = st.session_state.get("last_generated_key")
         if last_generated_key:
-            st.info(f"Ultima key gerada: {last_generated_key}")
+            st.code(last_generated_key, language="text")
+            st.caption("Copie a key acima.")
+
+        if st.button("Limpar expiradas", use_container_width=True):
+            deactivated = deactivate_expired_keys()
+            entries = load_keys()
+            expired_keys = [e["key"] for e in entries if is_key_expired(e) and not bool(e.get("active", True))]
+            for ek in expired_keys:
+                remove_key(ek)
+            st.success(f"{len(expired_keys)} key(s) expirada(s) removida(s).")
+            _rerun()
 
         keys = list_keys()
         if not keys:
@@ -202,14 +216,15 @@ def render_key_panel() -> None:
                         logout()
                     _rerun()
 
+            status_emoji = "ativa" if status["status"] == "ativa" and not status.get("expired") else "expirada"
             st.caption(
-                f"Status: {status['status']} | "
-                f"Expira: {entry['expires_at']} | "
+                f"Criada: {entry.get('created_at', '-')} | "
+                f"Expira: {entry.get('expires_at', '-')} | "
                 f"Restante: {get_remaining_time(entry)} | "
-                f"Resgatada: {entry.get('redeemed', False)} | "
-                f"IP: {entry.get('redeemed_ip') or '-'} | "
-                f"Resgatada em: {entry.get('redeemed_at') or '-'}"
+                f"Status: {status_emoji} | "
+                f"IP: {entry.get('redeemed_ip') or '-'}"
             )
+            print(f"[KEY] {key} | status={status_emoji} | expires_at={entry.get('expires_at')} | keys carregadas={len(keys)}")
 
 
 def render_online_users_panel() -> None:
