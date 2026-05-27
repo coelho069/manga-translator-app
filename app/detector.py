@@ -23,15 +23,21 @@ class BubbleDetector:
 
         cache_key = (str(self.model_path.resolve()), bool(config.use_gpu), "segment")
         if cache_key not in BubbleDetector._model_cache:
+            print(f"[YOLO_BUBBLE] model_load_start path={self.model_path}")
             BubbleDetector._model_cache[cache_key] = YOLO(str(self.model_path), task="segment")
-            print("[YOLO] modelo carregado")
+            print(
+                f"[YOLO_BUBBLE] model_loaded repo={getattr(config, 'hf_bubble_model_repo', '')} "
+                f"task=segment"
+            )
         self.model = BubbleDetector._model_cache[cache_key]
 
-    def detect(self, image: np.ndarray) -> list[SpeechBubble]:
+    def detect(self, image: np.ndarray, page_label: str | int | None = None) -> list[SpeechBubble]:
         if image is None or image.size == 0:
             return []
 
         height, width = image.shape[:2]
+        page = page_label if page_label is not None else f"{width}x{height}"
+        print(f"[YOLO_BUBBLE] detect_start page={page}")
         results = self.model.predict(
             image,
             task="segment",
@@ -45,7 +51,7 @@ class BubbleDetector:
         bubbles: list[SpeechBubble] = []
         if not results:
             self._save_detection_debug(image, bubbles)
-            print("[YOLO] baloes detectados: 0")
+            print(f"[YOLO_BUBBLE] detected page={page} count=0")
             return bubbles
 
         result = results[0]
@@ -76,9 +82,8 @@ class BubbleDetector:
             if bbox is None:
                 continue
 
-            bubble = SpeechBubble(id=0, bbox=bbox, mask=processed_mask)
-            if idx < len(confidences):
-                bubble.processing_notes.append(f"confidence={confidences[idx]:.3f}")
+            confidence = confidences[idx] if idx < len(confidences) else 0.0
+            bubble = SpeechBubble(id=0, bbox=bbox, mask=processed_mask, confidence=confidence)
             if not has_mask:
                 bubble.processing_notes.append("fallback_bbox_sem_mascara")
             bubbles.append(bubble)
@@ -86,9 +91,17 @@ class BubbleDetector:
         bubbles.sort(key=lambda item: (item.bbox.y1, item.bbox.x1))
         for index, bubble in enumerate(bubbles, start=1):
             bubble.id = index
+            conf = f"{getattr(bubble, 'confidence', 0.0):.3f}"
+            mask_area = int(cv2.countNonZero(bubble.mask)) if bubble.mask is not None else 0
+            print(
+                f"[BALLOON] index={bubble.id} "
+                f"bbox=({bubble.bbox.x1},{bubble.bbox.y1},{bubble.bbox.x2},{bubble.bbox.y2}) "
+                f"conf={conf}"
+            )
+            print(f"[BALLOON_MASK] index={bubble.id} mask_area={mask_area}")
 
         self._save_detection_debug(image, bubbles)
-        print(f"[YOLO] baloes detectados: {len(bubbles)}")
+        print(f"[YOLO_BUBBLE] detected page={page} count={len(bubbles)}")
         return bubbles
 
     def _ensure_model_file(self) -> Path:
@@ -246,7 +259,7 @@ class BubbleDetector:
                         "y2": bubble.bbox.y2,
                     },
                     "area": int(cv2.countNonZero(bubble.mask)),
-                    "confidence": self._confidence_from_notes(bubble.processing_notes),
+                    "confidence": float(getattr(bubble, "confidence", 0.0)),
                     "has_mask": "fallback_bbox_sem_mascara" not in bubble.processing_notes,
                     "notes": list(bubble.processing_notes),
                 }

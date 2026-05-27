@@ -12,8 +12,15 @@ from app.config import AppConfig
 from app.detector import BubbleDetector
 from app.ocr import OCRReader
 from app.renderer import TextRenderer
-from app.translator import BaseTranslator, GoogleTextTranslator
-from app.types import AppResult, SpeechBubble
+from app.translator import (
+    BaseTranslator,
+    Small100CT2Translator,
+    is_translation_valid,
+    normalize_lang_code,
+    normalize_punctuation,
+    preserve_terminal_punctuation,
+)
+from app.types import AppResult, BoundingBox, SpeechBubble
 from app.utils import ensure_dir, read_image_cv2, safe_text, write_image_cv2
 
 
@@ -35,7 +42,7 @@ class MangaTranslatorPipeline:
         ensure_dir(self.config.output_dir)
         self.detector = BubbleDetector(self.config)
         self.ocr = OCRReader(self.config)
-        self.translator = translator or GoogleTextTranslator(self.config)
+        self.translator = translator or Small100CT2Translator(self.config)
         self.cleaner = BubbleCleaner(self.config)
         self.renderer = TextRenderer(self.config)
         self.debug_dir: Path | None = None
@@ -71,7 +78,7 @@ class MangaTranslatorPipeline:
 
         self._progress(progress_callback, 0.16, "detectando baloes")
         step_start = perf_counter()
-        bubbles = self.detector.detect(image)
+        bubbles = self.detector.detect(image, page_label=original_image_path.name)
         timings["detect"] = self._elapsed(step_start)
 
         total = max(1, len(bubbles))
@@ -85,16 +92,22 @@ class MangaTranslatorPipeline:
             record["ocr_ran"] = True
 
             try:
-                raw_crop = self._masked_crop_for_ocr(image, bubble)
+                ocr_bbox = self._ocr_bbox_for_bubble(bubble, image.shape[:2])
+                bubble.ocr_bbox = ocr_bbox
+                print(
+                    f"[OCR_BBOX] balloon={bubble.id} "
+                    f"bbox=({ocr_bbox.x1},{ocr_bbox.y1},{ocr_bbox.x2},{ocr_bbox.y2})"
+                )
+                raw_crop = self._masked_crop_for_ocr(image, bubble, ocr_bbox)
                 if raw_crop is None or raw_crop.size == 0:
                     record["skipped_reason"] = "crop vazio para OCR"
                     bubble.processing_notes.append("crop vazio para OCR")
                     continue
 
                 crop, scale = self._resize_crop_for_ocr(raw_crop)
-                bubble.ocr_boxes = self.ocr.read(crop, offset_x=bubble.bbox.x1, offset_y=bubble.bbox.y1)
+                bubble.ocr_boxes = self.ocr.read(crop, offset_x=ocr_bbox.x1, offset_y=ocr_bbox.y1)
                 if scale != 1.0:
-                    self._rescale_ocr_boxes(bubble, scale)
+                    self._rescale_ocr_boxes(bubble, scale, ocr_bbox)
 
                 ocr_texts = [safe_text(box.text) for box in bubble.ocr_boxes if safe_text(box.text)]
                 if safe_text(self.config.source_lang).lower() == "ja":
@@ -117,30 +130,60 @@ class MangaTranslatorPipeline:
         page_texts = [bubble.source_text for bubble in translatable_bubbles]
 
         step_start = perf_counter()
+        total_translatable = len(translatable_bubbles)
+        translated_ok = 0
+        translation_failed = 0
+        src_for_log = normalize_lang_code(getattr(self.config, "source_lang", "en"), "auto") or "auto"
+        tgt_for_log = normalize_lang_code(getattr(self.config, "target_lang", "pt"), "pt") or "pt"
+
         if page_texts:
             self._progress(progress_callback, 0.48, "traduzindo")
-            try:
-                translations = self.translator.translate_batch(page_texts)
-            except Exception as exc:
-                translations = page_texts
-                for bubble in translatable_bubbles:
-                    bubble.processing_notes.append(f"erro em translate_batch; fallback aplicado: {exc}")
-
-            if len(translations) != len(translatable_bubbles):
-                translations = [
-                    safe_text(translations[idx]) if idx < len(translations) else bubble.source_text
-                    for idx, bubble in enumerate(translatable_bubbles)
-                ]
-
-            for bubble, translation in zip(translatable_bubbles, translations):
+            for bubble in translatable_bubbles:
                 record = flow_report[bubble.id]
                 record["translation_ran"] = True
-                bubble.translated_text = safe_text(translation) or bubble.source_text
-                record["translated_text"] = bubble.translated_text
-                print(f"[TRADUCAO] Bubble {bubble.id}: {bubble.source_text} -> {bubble.translated_text}")
-                if not bubble.translated_text:
-                    record["skipped_reason"] = "traducao vazia"
-                    bubble.processing_notes.append("sem traducao; balao mantido intacto")
+                source_text = bubble.source_text
+                in_snippet = source_text[:120].replace('"', "'")
+                print(
+                    f'[TRANSLATION_INPUT] balloon={bubble.id} '
+                    f'source={src_for_log} target={tgt_for_log} text="{in_snippet}"'
+                )
+
+                try:
+                    translated_raw = self.translator.translate_text(
+                        source_text,
+                        source_lang=src_for_log,
+                        target_lang=tgt_for_log,
+                    )
+                except Exception as exc:
+                    translation_failed += 1
+                    bubble.translated_text = ""
+                    record["skipped_reason"] = f"erro na traducao: {exc}"
+                    bubble.processing_notes.append(f"erro na traducao: {exc}")
+                    print(f"[TRANSLATION_ERROR] balloon={bubble.id} error={exc}")
+                    continue
+
+                translated = normalize_punctuation(translated_raw, tgt_for_log)
+                translated = preserve_terminal_punctuation(source_text, translated, tgt_for_log)
+                out_snippet = translated[:120].replace('"', "'")
+                print(f'[TRANSLATION_OUTPUT] balloon={bubble.id} text="{out_snippet}"')
+
+                valid, reason = is_translation_valid(source_text, translated, tgt_for_log)
+                print(f"[TRANSLATION_VALIDATE] balloon={bubble.id} valid={valid} reason={reason}")
+                if not valid:
+                    translation_failed += 1
+                    bubble.translated_text = ""
+                    record["skipped_reason"] = f"traducao invalida: {reason}"
+                    bubble.processing_notes.append(f"traducao invalida: {reason}")
+                    continue
+
+                bubble.translated_text = translated
+                record["translated_text"] = translated
+                translated_ok += 1
+
+        print(
+            f"[TRANSLATION_SUMMARY] total={total_translatable} "
+            f"translated={translated_ok} failed={translation_failed}"
+        )
         timings["translate"] = self._elapsed(step_start)
 
         work_image = image.copy()
@@ -151,6 +194,8 @@ class MangaTranslatorPipeline:
         if self.debug_dir is not None:
             self._save_debug_image("debug_before_cleanup.png", work_image)
 
+        bubble_masks_norm = self._build_normalized_masks(bubbles, image.shape[:2])
+
         for index, bubble in enumerate(bubbles):
             if not (bubble.source_text and bubble.translated_text):
                 continue
@@ -160,20 +205,40 @@ class MangaTranslatorPipeline:
             record["cleanup_ran"] = True
             bubble.cleanup_success = False
 
+            own_mask = bubble_masks_norm[index] if index < len(bubble_masks_norm) else None
+            others_union = np.zeros(image.shape[:2], dtype=np.uint8)
+            for j, bm in enumerate(bubble_masks_norm):
+                if j == index or bm is None:
+                    continue
+                if own_mask is not None and cv2.countNonZero(cv2.bitwise_and(own_mask, bm)) > 0:
+                    print(
+                        f"[CLEANUP_COLLISION] balloon={bubble.id} "
+                        f"other={bubbles[j].id} action=reduce_margin"
+                    )
+                others_union = cv2.bitwise_or(others_union, bm)
+            exclusion_mask = others_union
+
             self._progress(progress_callback, 0.62 + bubble_progress * 0.16, "apagando texto original")
             clean_start = perf_counter()
             try:
-                work_image = self.cleaner.clean(work_image, bubble)
+                work_image = self.cleaner.clean(work_image, bubble, exclusion_mask=exclusion_mask)
             except Exception as exc:
                 bubble.processing_notes.append(f"erro na limpeza: {exc}")
                 record["skipped_reason"] = f"erro na limpeza: {exc}"
                 self.last_block_reason = str(exc)
+                print(f"[CLEANUP_ERROR] balloon={bubble.id} error={exc}")
             clean_elapsed += self._elapsed(clean_start)
 
             if not self.cleaner.last_cleaned and bool(getattr(self.config, "force_clean_on_failed_mask", True)):
+                print(
+                    f"[CLEANUP_FALLBACK] balloon={bubble.id} method=fill_inside_mask "
+                    f"reason={self.cleaner.last_block_reason or 'cleanup_failed'}"
+                )
                 fallback_start = perf_counter()
                 try:
-                    work_image = self.cleaner.force_clean_bubble_inner_area(work_image, bubble)
+                    work_image = self.cleaner.force_clean_bubble_inner_area(
+                        work_image, bubble, exclusion_mask=exclusion_mask
+                    )
                 except Exception as exc:
                     bubble.processing_notes.append(f"erro no fallback de limpeza: {exc}")
                     if not record["skipped_reason"]:
@@ -223,10 +288,22 @@ class MangaTranslatorPipeline:
                     record["skipped_reason"] = "cleanup_success=False"
                 continue
 
+            render_rect = self.renderer.get_safe_text_rect(bubble, work_image.shape)
+            if render_rect is not None:
+                rx, ry, rw, rh = render_rect
+                bubble.render_bbox = BoundingBox(rx, ry, rx + rw, ry + rh)
+                print(f"[RENDER_BBOX] balloon={bubble.id} bbox=({rx},{ry},{rx + rw},{ry + rh})")
+            print(f"[RENDER] draw_after_cleanup balloon={bubble.id}")
             try:
                 work_image = self.renderer.render(work_image, bubble)
-                record["render_ran"] = True
-                print(f"[PIPELINE] Bubble {bubble.id}: traducao renderizada com sucesso")
+                if bool(getattr(bubble, "render_success", False)):
+                    record["render_ran"] = True
+                    print(f"[PIPELINE] Bubble {bubble.id}: traducao renderizada com sucesso")
+                    print(f"[RENDER_SUCCESS] balloon={bubble.id}")
+                else:
+                    last_note = bubble.processing_notes[-1] if bubble.processing_notes else "render_returned_no_draw"
+                    if not record["skipped_reason"]:
+                        record["skipped_reason"] = f"render falhou: {last_note}"
             except Exception as exc:
                 if not record["skipped_reason"]:
                     record["skipped_reason"] = f"erro na renderizacao: {exc}"
@@ -344,15 +421,26 @@ class MangaTranslatorPipeline:
         return round(perf_counter() - start, 4)
 
     @staticmethod
-    def _masked_crop_for_ocr(image: np.ndarray, bubble: SpeechBubble) -> np.ndarray:
-        crop = image[bubble.bbox.y1 : bubble.bbox.y2, bubble.bbox.x1 : bubble.bbox.x2]
+    def _ocr_bbox_for_bubble(bubble: SpeechBubble, shape: tuple[int, int]) -> BoundingBox:
+        image_h, image_w = shape[:2]
+        margin = max(2, min(12, int(max(bubble.bbox.width, bubble.bbox.height) * 0.04)))
+        return BoundingBox(
+            x1=max(0, bubble.bbox.x1 - margin),
+            y1=max(0, bubble.bbox.y1 - margin),
+            x2=min(image_w, bubble.bbox.x2 + margin),
+            y2=min(image_h, bubble.bbox.y2 + margin),
+        )
+
+    @staticmethod
+    def _masked_crop_for_ocr(image: np.ndarray, bubble: SpeechBubble, ocr_bbox: BoundingBox) -> np.ndarray:
+        crop = image[ocr_bbox.y1 : ocr_bbox.y2, ocr_bbox.x1 : ocr_bbox.x2]
         if crop is None or crop.size == 0:
             return crop
 
         if getattr(bubble, "mask", None) is None or bubble.mask.size == 0:
             return crop
 
-        mask_crop = bubble.mask[bubble.bbox.y1 : bubble.bbox.y2, bubble.bbox.x1 : bubble.bbox.x2]
+        mask_crop = bubble.mask[ocr_bbox.y1 : ocr_bbox.y2, ocr_bbox.x1 : ocr_bbox.x2]
         if mask_crop is None or mask_crop.size == 0:
             return crop
         if mask_crop.shape[:2] != crop.shape[:2]:
@@ -378,11 +466,11 @@ class MangaTranslatorPipeline:
         return resized, scale
 
     @staticmethod
-    def _rescale_ocr_boxes(bubble: SpeechBubble, scale: float) -> None:
+    def _rescale_ocr_boxes(bubble: SpeechBubble, scale: float, ocr_bbox: BoundingBox) -> None:
         if scale <= 0 or scale == 1.0:
             return
-        ox = bubble.bbox.x1
-        oy = bubble.bbox.y1
+        ox = ocr_bbox.x1
+        oy = ocr_bbox.y1
         for box in bubble.ocr_boxes:
             scaled_polygon = []
             for x, y in box.polygon:
@@ -454,6 +542,28 @@ class MangaTranslatorPipeline:
         if self.debug_dir is None or image is None or image.size == 0:
             return
         write_image_cv2(Path(self.debug_dir) / filename, image)
+
+    @staticmethod
+    def _build_normalized_masks(
+        bubbles: list[SpeechBubble], shape: tuple[int, int]
+    ) -> list[np.ndarray]:
+        masks: list[np.ndarray] = []
+        for b in bubbles:
+            bm = getattr(b, "mask", None)
+            normalized = np.zeros(shape, dtype=np.uint8)
+            if bm is not None and bm.size > 0:
+                h = min(shape[0], bm.shape[0])
+                w = min(shape[1], bm.shape[1])
+                normalized[:h, :w] = (bm[:h, :w] > 0).astype(np.uint8) * 255
+            else:
+                x1 = max(0, min(shape[1], b.bbox.x1))
+                y1 = max(0, min(shape[0], b.bbox.y1))
+                x2 = max(0, min(shape[1], b.bbox.x2))
+                y2 = max(0, min(shape[0], b.bbox.y2))
+                if x2 > x1 and y2 > y1:
+                    normalized[y1:y2, x1:x2] = 255
+            masks.append(normalized)
+        return masks
 
     @staticmethod
     def _draw_debug_bboxes(image: np.ndarray, bubbles: list[SpeechBubble]) -> np.ndarray:

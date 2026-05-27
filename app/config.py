@@ -9,6 +9,11 @@ class AppConfig:
     hf_bubble_model_filename: str = "model.pt"
     auto_download_bubble_model: bool = True
     output_dir: Path = Path("output")
+    translation_provider: str = "small100_ct2"
+    translation_model: str = "entai2965/small100-ctranslate2"
+    translation_cache_enabled: bool = True
+    translation_timeout_seconds: int = 120
+    translation_beam_size: int = 4
     translation_mode: str = "en_to_pt"
     source_lang: str = "en"
     target_lang: str = "pt"

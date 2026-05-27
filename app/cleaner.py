@@ -22,7 +22,12 @@ class BubbleCleaner:
         self.last_before_image: np.ndarray | None = None
         self.last_after_image: np.ndarray | None = None
 
-    def clean(self, image: np.ndarray, bubble: SpeechBubble) -> np.ndarray:
+    def clean(
+        self,
+        image: np.ndarray,
+        bubble: SpeechBubble,
+        exclusion_mask: np.ndarray | None = None,
+    ) -> np.ndarray:
         self._reset_debug(image)
         bubble.cleanup_success = False
         self.last_before_image = image.copy()
@@ -32,71 +37,108 @@ class BubbleCleaner:
             self.last_block_reason = "imagem invalida"
             return image
 
+        print(f"[CLEANUP] start balloon={bubble.id} method=segmentation_mask")
+        print(
+            f"[CLEANUP] balloon_bbox=({bubble.bbox.x1},{bubble.bbox.y1},"
+            f"{bubble.bbox.x2},{bubble.bbox.y2})"
+        )
         inner_mask = self._inner_bubble_mask(
             mask=getattr(bubble, "mask", None),
             shape=image.shape[:2],
             bubble=bubble,
+            exclusion_mask=exclusion_mask,
         )
         self.last_inner_mask = inner_mask.copy()
 
-        if cv2.countNonZero(inner_mask) == 0:
-            self._add_note(bubble, "mascara interna vazia")
-            self.last_cleaned = False
-            self.last_block_reason = "mascara interna vazia"
-            self._log_cleanup_status(bubble, 0, 0, 0)
-            return image
-
         ocr_mask = self._ocr_text_mask(bubble, image.shape[:2])
-        dark_mask = (
-            self._dark_text_mask(image=image, inner_mask=inner_mask, bubble=bubble)
-            if bool(getattr(self.config, "use_dark_text_fallback", True))
-            else np.zeros(image.shape[:2], dtype=np.uint8)
-        )
+        ocr_coords = cv2.findNonZero(ocr_mask)
+        if ocr_coords is not None:
+            tx, ty, tw, th = cv2.boundingRect(ocr_coords)
+            print(
+                f"[CLEANUP] text_bbox=({tx},{ty},{tx + tw},{ty + th}) source=ocr_polygons"
+            )
+        else:
+            print("[CLEANUP] text_bbox=none source=no_ocr_polygons")
 
         self.last_ocr_mask = ocr_mask.copy()
-        self.last_dark_mask = dark_mask.copy()
+        self.last_dark_mask = np.zeros(image.shape[:2], dtype=np.uint8)
 
-        ocr_pixels = cv2.countNonZero(ocr_mask)
-        dark_pixels = cv2.countNonZero(dark_mask)
+        # Cleanup mask: area de texto detectada/fallback central, sempre
+        # intersectada com a mascara YOLO do balao atual.
+        cleanup_mask = self._build_cleanup_mask(
+            bubble=bubble,
+            image=image,
+            shape=image.shape[:2],
+            ocr_mask=ocr_mask,
+            inner_mask=inner_mask,
+            exclusion_mask=exclusion_mask,
+        )
 
-        final_mask = cv2.bitwise_or(ocr_mask, dark_mask)
-        final_mask = cv2.bitwise_and(final_mask, inner_mask)
+        cleanup_coords = cv2.findNonZero(cleanup_mask)
+        cleanup_pixels = int(cv2.countNonZero(cleanup_mask))
+        if cleanup_coords is not None:
+            cx, cy, cw, ch = cv2.boundingRect(cleanup_coords)
+            print(
+                f"[CLEANUP] expanded_text_bbox=({cx},{cy},{cx + cw},{cy + ch})"
+            )
+            print(
+                f"[CLEANUP_MASK] balloon={bubble.id} "
+                f"bbox=({cx},{cy},{cx + cw},{cy + ch}) mask_area={cleanup_pixels}"
+            )
+        else:
+            print("[CLEANUP] expanded_text_bbox=empty")
+            print(f"[CLEANUP_MASK] balloon={bubble.id} bbox=empty mask_area=0")
+        print(
+            f"[CLEANUP_PLAN] balloon={bubble.id} "
+            f"strategy=text_area_intersect_balloon_mask "
+            f"has_bubble_mask={getattr(bubble, 'mask', None) is not None} "
+            f"ocr_polygons={len(getattr(bubble, 'ocr_boxes', []))} "
+            f"mask_area={cleanup_pixels}"
+        )
+        print(f"[CLEANUP] mask_area={cleanup_pixels}")
 
-        if cv2.countNonZero(final_mask) > 0:
-            final_mask = self._refine_text_mask(final_mask, inner_mask)
-            final_mask = self._filter_if_too_large(final_mask, inner_mask, bubble)
+        self.last_cleanup_mask = cleanup_mask.copy()
 
-        if cv2.countNonZero(final_mask) == 0:
-            final_mask = self._fallback_inner_cleanup_mask(inner_mask, bubble)
-
-        self.last_cleanup_mask = final_mask.copy()
-        final_pixels = cv2.countNonZero(final_mask)
-
-        self._log_cleanup_status(bubble, ocr_pixels, dark_pixels, final_pixels)
-
-        if final_pixels == 0:
+        if cleanup_pixels == 0:
             self.last_cleaned = False
             bubble.cleanup_success = False
-            self.last_block_reason = "sem mascara final"
-            self._add_note(bubble, "falha na limpeza: sem mascara final")
+            self.last_block_reason = "cleanup_mask vazia"
+            self._add_note(bubble, "falha na limpeza: cleanup_mask vazia")
+            print(f"[CLEANUP_ERROR] balloon={bubble.id} error=cleanup_mask_empty")
             return image
 
         mode = safe_text(getattr(self.config, "cleaner_mode", "white_fill")).lower()
+        print(f"[CLEANUP] method=segmentation_mask cleaner_mode={mode} balloon={bubble.id}")
         if mode == "inpaint":
             cleaned = cv2.inpaint(
                 image,
-                final_mask,
+                cleanup_mask,
                 int(max(1, getattr(self.config, "inpaint_radius", 5))),
                 cv2.INPAINT_TELEA,
             )
         else:
-            cleaned = self._white_fill(image, final_mask, inner_mask)
+            cleaned = self._white_fill(image, cleanup_mask, cleanup_mask)
 
         self.last_after_image = cleaned.copy()
 
+        verify_mask = cleanup_mask
         residual_ok, residual_count, residual_ratio = self._verify_cleanup(
-            cleaned, inner_mask, bubble
+            cleaned, verify_mask, bubble
         )
+
+        if not residual_ok:
+            print(
+                f"[CLEANUP_FALLBACK] balloon={bubble.id} method=fill_inside_mask "
+                f"reason=residual_{residual_ratio:.2%}_post_clean"
+            )
+            forced_mask = cleanup_mask
+            forced_mask = self._apply_exclusion(forced_mask, exclusion_mask, image.shape[:2])
+            self.last_cleanup_mask = forced_mask.copy()
+            cleaned = self._white_fill(image, forced_mask, forced_mask)
+            self.last_after_image = cleaned.copy()
+            residual_ok, residual_count, residual_ratio = self._verify_cleanup(
+                cleaned, verify_mask, bubble
+            )
 
         if not residual_ok:
             self.last_cleaned = False
@@ -112,9 +154,15 @@ class BubbleCleaner:
         self.last_residual_dark_pixels = residual_count
         self.last_residual_ratio = residual_ratio
         print(f"[CLEANER] Bubble {bubble.id}: limpeza OK - residual {residual_count} pixels ({residual_ratio:.1%})")
+        print(f"[CLEANUP_SUCCESS] balloon={bubble.id}")
         return cleaned
 
-    def force_clean_bubble_inner_area(self, image: np.ndarray, bubble: SpeechBubble) -> np.ndarray:
+    def force_clean_bubble_inner_area(
+        self,
+        image: np.ndarray,
+        bubble: SpeechBubble,
+        exclusion_mask: np.ndarray | None = None,
+    ) -> np.ndarray:
         self._reset_debug(image)
         bubble.cleanup_success = False
         self.last_before_image = image.copy()
@@ -127,9 +175,12 @@ class BubbleCleaner:
             mask=getattr(bubble, "mask", None),
             shape=image.shape[:2],
             bubble=bubble,
+            exclusion_mask=exclusion_mask,
         )
         if cv2.countNonZero(inner_mask) == 0:
-            inner_mask = self._bbox_inner_mask(image.shape[:2], bubble)
+            inner_mask = self._bbox_inner_mask(
+                image.shape[:2], bubble, exclusion_mask=exclusion_mask
+            )
 
         self.last_inner_mask = inner_mask.copy()
         self.last_ocr_mask = np.zeros_like(inner_mask)
@@ -142,6 +193,10 @@ class BubbleCleaner:
             self.last_block_reason = "mascara interna vazia no fallback"
             return image
 
+        print(
+            f"[CLEANUP_FALLBACK] balloon={bubble.id} method=fill_inside_mask "
+            f"reason={self.last_block_reason or 'forced_inner_fill'}"
+        )
         cleaned = self._white_fill(image, inner_mask, inner_mask)
         self.last_after_image = cleaned.copy()
 
@@ -236,11 +291,99 @@ class BubbleCleaner:
         self.last_before_image = None
         self.last_after_image = None
 
+    def _build_cleanup_mask(
+        self,
+        bubble: SpeechBubble,
+        image: np.ndarray,
+        shape: tuple[int, int],
+        ocr_mask: np.ndarray,
+        inner_mask: np.ndarray,
+        exclusion_mask: np.ndarray | None,
+    ) -> np.ndarray:
+        """Build text cleanup area and clamp it to the current YOLO bubble mask."""
+        balloon_mask = np.zeros(shape, dtype=np.uint8)
+        bubble_mask = getattr(bubble, "mask", None)
+        if bubble_mask is not None and bubble_mask.size > 0:
+            h = min(shape[0], bubble_mask.shape[0])
+            w = min(shape[1], bubble_mask.shape[1])
+            balloon_mask[:h, :w] = (bubble_mask[:h, :w] > 0).astype(np.uint8) * 255
+        else:
+            bx1 = max(0, min(shape[1], bubble.bbox.x1))
+            by1 = max(0, min(shape[0], bubble.bbox.y1))
+            bx2 = max(0, min(shape[1], bubble.bbox.x2))
+            by2 = max(0, min(shape[0], bubble.bbox.y2))
+            if bx2 > bx1 and by2 > by1:
+                balloon_mask[by1:by2, bx1:bx2] = 255
+
+        if cv2.countNonZero(balloon_mask) == 0:
+            return balloon_mask
+
+        text_area = np.zeros(shape, dtype=np.uint8)
+        if ocr_mask is not None and cv2.countNonZero(ocr_mask) > 0:
+            text_area = ocr_mask.copy()
+        else:
+            dark_mask = self._dark_text_mask(image, inner_mask, bubble)
+            self.last_dark_mask = dark_mask.copy()
+            if cv2.countNonZero(dark_mask) > 0:
+                text_area = dark_mask
+            else:
+                text_area = self._central_cleanup_area(balloon_mask, bubble)
+
+        text_area = self._refine_text_mask(text_area, balloon_mask)
+        text_area = cv2.bitwise_and(text_area, balloon_mask)
+        if exclusion_mask is None or exclusion_mask.size == 0:
+            return text_area
+
+        before = cv2.countNonZero(text_area)
+        result = self._apply_exclusion(text_area, exclusion_mask, shape)
+        after = cv2.countNonZero(result)
+        if before > 0 and after < before:
+            print(
+                f"[CLEANUP_COLLISION] balloon={bubble.id} "
+                f"other=neighbor pixels_excluded={before - after} action=reduce_margin"
+            )
+        return result
+
+    def _central_cleanup_area(self, balloon_mask: np.ndarray, bubble: SpeechBubble) -> np.ndarray:
+        coords = cv2.findNonZero(balloon_mask)
+        fallback = np.zeros_like(balloon_mask)
+        if coords is None:
+            return fallback
+
+        x, y, w, h = cv2.boundingRect(coords)
+        margin_x = max(2, int(w * 0.14))
+        margin_y = max(2, int(h * 0.14))
+        x1 = max(x, x + margin_x)
+        y1 = max(y, y + margin_y)
+        x2 = min(x + w, x + w - margin_x)
+        y2 = min(y + h, y + h - margin_y)
+        if x2 <= x1 or y2 <= y1:
+            x1, y1, x2, y2 = x, y, x + w, y + h
+        fallback[y1:y2, x1:x2] = 255
+        fallback = cv2.bitwise_and(fallback, balloon_mask)
+        self._add_note(bubble, "fallback central: limpeza limitada ao balao")
+        return fallback
+
+    @staticmethod
+    def _apply_exclusion(
+        mask: np.ndarray,
+        exclusion_mask: np.ndarray | None,
+        shape: tuple[int, int],
+    ) -> np.ndarray:
+        if exclusion_mask is None or exclusion_mask.size == 0:
+            return mask
+        exclude = np.zeros(shape, dtype=np.uint8)
+        eh = min(shape[0], exclusion_mask.shape[0])
+        ew = min(shape[1], exclusion_mask.shape[1])
+        exclude[:eh, :ew] = (exclusion_mask[:eh, :ew] > 0).astype(np.uint8) * 255
+        return cv2.subtract(mask, exclude)
+
     def _inner_bubble_mask(
         self,
         mask: np.ndarray | None,
         shape: tuple[int, int],
         bubble: SpeechBubble,
+        exclusion_mask: np.ndarray | None = None,
     ) -> np.ndarray:
         base = np.zeros(shape, dtype=np.uint8)
 
@@ -257,6 +400,20 @@ class BubbleCleaner:
             if x2 > x1 and y2 > y1:
                 base[y1:y2, x1:x2] = 255
 
+        if exclusion_mask is not None and exclusion_mask.size > 0:
+            exclude = np.zeros(shape, dtype=np.uint8)
+            eh = min(shape[0], exclusion_mask.shape[0])
+            ew = min(shape[1], exclusion_mask.shape[1])
+            exclude[:eh, :ew] = (exclusion_mask[:eh, :ew] > 0).astype(np.uint8) * 255
+            before = cv2.countNonZero(base)
+            base = cv2.subtract(base, exclude)
+            after = cv2.countNonZero(base)
+            if before > 0 and after < before:
+                print(
+                    f"[CLEANUP_COLLISION] balloon={bubble.id} "
+                    f"pixels_excluded={before - after} action=mask_subtract"
+                )
+
         if cv2.countNonZero(base) == 0:
             return base
 
@@ -269,7 +426,12 @@ class BubbleCleaner:
 
         return base
 
-    def _bbox_inner_mask(self, shape: tuple[int, int], bubble: SpeechBubble) -> np.ndarray:
+    def _bbox_inner_mask(
+        self,
+        shape: tuple[int, int],
+        bubble: SpeechBubble,
+        exclusion_mask: np.ndarray | None = None,
+    ) -> np.ndarray:
         mask = np.zeros(shape, dtype=np.uint8)
         margin = max(1, int(getattr(self.config, "bubble_erode_px", 8)))
         x1 = max(0, bubble.bbox.x1 + margin)
@@ -278,6 +440,13 @@ class BubbleCleaner:
         y2 = min(shape[0], bubble.bbox.y2 - margin)
         if x2 > x1 and y2 > y1:
             mask[y1:y2, x1:x2] = 255
+
+        if exclusion_mask is not None and exclusion_mask.size > 0:
+            exclude = np.zeros(shape, dtype=np.uint8)
+            eh = min(shape[0], exclusion_mask.shape[0])
+            ew = min(shape[1], exclusion_mask.shape[1])
+            exclude[:eh, :ew] = (exclusion_mask[:eh, :ew] > 0).astype(np.uint8) * 255
+            mask = cv2.subtract(mask, exclude)
         return mask
 
     def _ocr_text_mask(self, bubble: SpeechBubble, shape: tuple[int, int]) -> np.ndarray:
@@ -421,19 +590,16 @@ class BubbleCleaner:
         if ratio <= limit:
             return final_mask
 
-        filtered = self._filter_text_components(final_mask, inner_mask, bubble)
-        filtered = self._close(filtered, self._mode_radius(int(getattr(self.config, "cleanup_morph_close_px", 5))))
-        filtered = cv2.bitwise_and(filtered, inner_mask)
-
-        filtered_pixels = cv2.countNonZero(filtered)
-        if filtered_pixels <= 0:
-            return np.zeros_like(final_mask)
-
-        filtered_ratio = filtered_pixels / inner_pixels
-        if filtered_ratio <= limit:
-            return filtered
-
-        return np.zeros_like(final_mask)
+        # Texto cobre muita area do balao (>limit). Tentar filtrar componentes
+        # arrisca deixar kanji grandes ou texto vertical de fora da limpeza.
+        # Como ja temos a mascara de segmentacao do balao (com exclusao de
+        # balões vizinhos via inner_mask), limpamos o interior inteiro - a
+        # traducao sera renderizada por cima.
+        print(
+            f"[CLEANUP_FALLBACK] balloon={bubble.id} method=fill_inside_mask "
+            f"reason=text_density_{ratio:.2f}_above_{limit:.2f}"
+        )
+        return inner_mask.copy()
 
     def _fallback_inner_cleanup_mask(self, inner_mask: np.ndarray, bubble: SpeechBubble) -> np.ndarray:
         allow_force = bool(getattr(self.config, "force_clean_on_failed_mask", True))

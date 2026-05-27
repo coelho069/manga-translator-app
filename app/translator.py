@@ -2,81 +2,171 @@ from __future__ import annotations
 
 import re
 import threading
-from functools import lru_cache
+from pathlib import Path
 
 from app.config import AppConfig
-from app.glossary import GLOSSARY
-from app.utils import resolve_translation_lang, safe_text
+from app.utils import safe_text
 
 
-IDIOMATIC_MAP = {
-    "no way": "nao pode ser",
-    "i got it": "entendi",
-    "got it": "entendi",
-    "shut up": "cala a boca",
-    "damn it": "droga",
-    "what the hell": "que diabos",
-    "are you okay": "voce esta bem",
-    "leave it to me": "deixa comigo",
-    "i'm counting on you": "conto com voce",
-    "i will protect you": "eu vou te proteger",
-    "don't give up": "nao desista",
+PROVIDER_NAME = "small100_ct2"
+MODEL_REPO = "entai2965/small100-ctranslate2"
+VOCAB_FALLBACK_REPO = "alirezamsh/small100"
+
+
+_LANG_ALIAS = {
+    "jp": "ja",
+    "japanese": "ja",
+    "japones": "ja",
+    "japonês": "ja",
+    "en_us": "en",
+    "en_gb": "en",
+    "english": "en",
+    "ingles": "en",
+    "inglês": "en",
+    "pt_br": "pt",
+    "pt_pt": "pt",
+    "portuguese": "pt",
+    "portugues": "pt",
+    "português": "pt",
+    "zh_cn": "zh",
+    "zh_tw": "zh",
+    "zh_hans": "zh",
+    "chinese": "zh",
+    "chines": "zh",
+    "chinês": "zh",
+    "ko_kr": "ko",
+    "korean": "ko",
+    "ru_ru": "ru",
+    "russian": "ru",
+    "es_es": "es",
+    "spanish": "es",
+    "espanhol": "es",
+    "auto": "auto",
 }
 
-JA_HONORIFICS = [
-    "さん",
-    "くん",
-    "ちゃん",
-    "先輩",
-    "先生",
-    "様",
-]
-
-COMMON_INITIAL_WORDS = {
-    "A",
-    "An",
-    "And",
-    "Are",
-    "But",
-    "Come",
-    "Did",
-    "Do",
-    "Does",
-    "Don",
-    "Go",
-    "He",
-    "Hey",
-    "His",
-    "How",
-    "I",
-    "If",
-    "It",
-    "Let",
-    "No",
-    "Oh",
-    "Please",
-    "She",
-    "So",
-    "That",
-    "The",
-    "Then",
-    "They",
-    "This",
-    "Wait",
-    "We",
-    "What",
-    "When",
-    "Where",
-    "Who",
-    "Why",
-    "You",
+SMALL100_LANGS = {
+    "af", "am", "ar", "ast", "az", "ba", "be", "bg", "bn", "br", "bs",
+    "ca", "ceb", "cs", "cy", "da", "de", "el", "en", "es", "et", "fa",
+    "ff", "fi", "fr", "fy", "ga", "gd", "gl", "gu", "ha", "he", "hi",
+    "hr", "ht", "hu", "hy", "id", "ig", "ilo", "is", "it", "ja", "jv",
+    "ka", "kk", "km", "kn", "ko", "lb", "lg", "ln", "lo", "lt", "lv",
+    "mg", "mk", "ml", "mn", "mr", "ms", "my", "ne", "nl", "no", "ns",
+    "oc", "or", "pa", "pl", "ps", "pt", "ro", "ru", "sd", "si", "sk",
+    "sl", "so", "sq", "sr", "ss", "su", "sv", "sw", "ta", "th", "tl",
+    "tn", "tr", "uk", "ur", "uz", "vi", "wo", "xh", "yi", "yo", "zh", "zu",
 }
 
-TITLE_NAME_RE = re.compile(
-    r"\b(?:Mr|Mrs|Ms|Dr|Lord|Lady|Princess|Prince|King|Queen|Sir|Master)\.\s+[A-Z][a-zA-Z'-]*"
-    r"|\b(?:Mr|Mrs|Ms|Dr|Lord|Lady|Princess|Prince|King|Queen|Sir|Master)\s+[A-Z][a-zA-Z'-]*"
+
+_FORBIDDEN_PREFIXES = (
+    "translation:",
+    "translated:",
+    "portuguese:",
+    "english:",
+    "spanish:",
+    "japanese:",
+    "tradução:",
+    "traducao:",
 )
-CAPITALIZED_RE = re.compile(r"\b[A-Z][a-zA-Z'-]{2,}\b")
+
+_SCRIPT_PATTERNS = {
+    "ja": re.compile(r"[぀-ゟ゠-ヿ一-龯]"),
+    "zh": re.compile(r"[一-鿿]"),
+    "ko": re.compile(r"[가-힯]"),
+    "ru": re.compile(r"[Ѐ-ӿ]"),
+}
+
+
+def normalize_lang_code(value, default: str = "") -> str:
+    text = safe_text(value).lower().replace("-", "_")
+    if not text:
+        return default
+    code = _LANG_ALIAS.get(text, text)
+    if "_" in code:
+        code = code.split("_", 1)[0]
+    return code or default
+
+
+def is_translation_valid(
+    original: str,
+    translated: str,
+    target_lang: str,
+) -> tuple[bool, str]:
+    tgt_text = safe_text(translated)
+    src_text = safe_text(original)
+
+    if not tgt_text:
+        return False, "empty"
+
+    stripped = re.sub(r"[\s\.,;:!?\-—…\"'\(\)\[\]·]+", "", tgt_text)
+    if not stripped:
+        return False, "only_punctuation_or_space"
+
+    lower = tgt_text.lower()
+    for prefix in _FORBIDDEN_PREFIXES:
+        if lower.startswith(prefix):
+            return False, f"has_prefix:{prefix}"
+
+    tgt_norm = normalize_lang_code(target_lang, "pt")
+
+    if tgt_text == src_text:
+        if tgt_norm in _SCRIPT_PATTERNS and _SCRIPT_PATTERNS[tgt_norm].search(src_text):
+            return True, "same_text_already_in_target"
+        return False, "same_as_source"
+
+    if tgt_norm in _SCRIPT_PATTERNS:
+        if not _SCRIPT_PATTERNS[tgt_norm].search(tgt_text):
+            return False, f"missing_{tgt_norm}_script"
+        return True, "ok"
+
+    for src_code, pattern in _SCRIPT_PATTERNS.items():
+        if pattern.search(tgt_text):
+            return False, f"still_in_{src_code}_script"
+
+    return True, "ok"
+
+
+def normalize_punctuation(text: str, target_lang: str) -> str:
+    clean = safe_text(text)
+    if not clean:
+        return ""
+
+    clean = clean.replace("…", "...")
+    clean = re.sub(r"\s+([,.;:!?])", r"\1", clean)
+    clean = re.sub(r"\s*\.\s*\.\s*\.", "...", clean)
+    clean = re.sub(r"\.{4,}", "...", clean)
+    clean = re.sub(r"!{3,}", "!!", clean)
+    clean = re.sub(r"\?{3,}", "??", clean)
+    clean = re.sub(r"\s+([!?]+)", r"\1", clean)
+    clean = re.sub(r"\s+", " ", clean)
+    return safe_text(clean)
+
+
+def preserve_terminal_punctuation(source: str, translated: str, target_lang: str) -> str:
+    clean_translated = safe_text(translated)
+    if not clean_translated:
+        return ""
+
+    _, source_punctuation = _split_terminal_punctuation(source)
+    if not source_punctuation:
+        return clean_translated
+    if re.search(r"([!?.]+|\?!|!\?)$", clean_translated):
+        return clean_translated
+    return normalize_punctuation(clean_translated + source_punctuation, target_lang)
+
+
+def _split_terminal_punctuation(text: str) -> tuple[str, str]:
+    clean = safe_text(text)
+    if not clean:
+        return "", ""
+
+    for raw, mapped in (("！？", "?!"), ("？！", "?!"), ("。", "."), ("！", "!"), ("？", "?"), ("…", "...")):
+        if clean.endswith(raw):
+            return clean[: -len(raw)], mapped
+
+    match = re.search(r"([!?.]+|\?!|!\?)$", clean)
+    if not match:
+        return clean, ""
+    return clean[: match.start()], match.group(0)
 
 
 class BaseTranslator:
@@ -95,233 +185,135 @@ class IdentityTranslator(BaseTranslator):
         return [safe_text(text) for text in texts]
 
 
-class GoogleTextTranslator(BaseTranslator):
-    _client_cache = {}
-    _client_lock = threading.Lock()
+class Small100CT2Translator(BaseTranslator):
+    _load_lock = threading.Lock()
+    _shared_translator = None
+    _shared_spm = None
 
     def __init__(self, config: AppConfig):
         self.config = config
-        self.translation_mode = safe_text(config.translation_mode) or "en_to_pt"
-        self.source_lang = resolve_translation_lang(config.source_lang)
-        self.target_lang = resolve_translation_lang(config.target_lang)
-        self.translation_style = self._normalize_style(config.translation_style)
-        self._page_memory: dict[str, str] = {}
+        self.default_source = normalize_lang_code(getattr(config, "source_lang", "en"), "auto") or "auto"
+        self.default_target = normalize_lang_code(getattr(config, "target_lang", "pt"), "pt") or "pt"
+        if self.default_target not in SMALL100_LANGS:
+            self.default_target = "pt"
+        self.cache_enabled = bool(getattr(config, "translation_cache_enabled", True))
+        self._beam_size = int(getattr(config, "translation_beam_size", 4) or 4)
+        self._cache: dict[tuple[str, str, str], str] = {}
+        print(
+            f"[TRANSLATOR] provider={PROVIDER_NAME} model={MODEL_REPO} "
+            f"source={self.default_source} target={self.default_target}"
+        )
+
+    @classmethod
+    def _ensure_model(cls):
+        if cls._shared_translator is not None:
+            return cls._shared_translator, cls._shared_spm
+
+        with cls._load_lock:
+            if cls._shared_translator is not None:
+                return cls._shared_translator, cls._shared_spm
+
+            import ctranslate2
+            import sentencepiece as spm_lib
+            from huggingface_hub import snapshot_download
+
+            print(f"[TRANSLATOR_LOAD] model={MODEL_REPO}")
+            model_dir = Path(snapshot_download(repo_id=MODEL_REPO))
+            spm_path = cls._find_spm(model_dir)
+            if spm_path is None:
+                fallback_dir = Path(
+                    snapshot_download(
+                        repo_id=VOCAB_FALLBACK_REPO,
+                        allow_patterns=[
+                            "sentencepiece.bpe.model",
+                            "sentencepiece.model",
+                            "spm.model",
+                            "vocab.json",
+                        ],
+                    )
+                )
+                spm_path = cls._find_spm(fallback_dir)
+            if spm_path is None:
+                raise FileNotFoundError(
+                    "SentencePiece model file não encontrado nem em "
+                    f"{MODEL_REPO} nem em {VOCAB_FALLBACK_REPO}."
+                )
+
+            sp = spm_lib.SentencePieceProcessor()
+            sp.load(str(spm_path))
+
+            translator = ctranslate2.Translator(
+                str(model_dir),
+                device="cpu",
+                compute_type="int8",
+            )
+
+            cls._shared_translator = translator
+            cls._shared_spm = sp
+            return translator, sp
+
+    @staticmethod
+    def _find_spm(directory: Path) -> Path | None:
+        for name in ("sentencepiece.bpe.model", "sentencepiece.model", "spm.model"):
+            candidate = directory / name
+            if candidate.exists():
+                return candidate
+        return None
 
     def translate(self, text: str) -> str:
+        return self.translate_text(text, self.default_source, self.default_target)
+
+    def translate_batch(self, texts: list[str]) -> list[str]:
+        return [
+            self.translate_text(t, self.default_source, self.default_target)
+            for t in texts
+        ]
+
+    def translate_text(
+        self,
+        text: str,
+        source_lang: str = "auto",
+        target_lang: str = "pt",
+    ) -> str:
+        src = normalize_lang_code(source_lang, self.default_source) or "auto"
+        tgt = normalize_lang_code(target_lang, self.default_target) or "pt"
+        if tgt not in SMALL100_LANGS:
+            tgt = "pt"
+
         clean = safe_text(text)
         if not clean:
             return ""
-        if clean in self._page_memory:
-            return self._page_memory[clean]
-        translated = self._translate_one(clean)
-        self._page_memory[clean] = translated
-        return translated
 
-    def translate_batch(self, texts: list[str]) -> list[str]:
-        clean_texts = [safe_text(text) for text in texts]
-        unique_to_translate: list[str] = []
-        seen = set()
-        for text in clean_texts:
-            if not text or text in self._page_memory or text in seen:
-                continue
-            seen.add(text)
-            unique_to_translate.append(text)
+        cache_key = (clean, src, tgt)
+        if self.cache_enabled and cache_key in self._cache:
+            print(f"[TRANSLATION_CACHE_HIT] source={src} target={tgt}")
+            return self._cache[cache_key]
 
-        for text in unique_to_translate:
-            translated = self._translate_one(text)
-            self._page_memory[text] = translated
+        translator, sp = self._ensure_model()
 
-        return [self._page_memory.get(text, "") if text else "" for text in clean_texts]
+        pieces = sp.encode(clean, out_type=str)
+        tgt_token = f"__{tgt}__"
+        source_tokens = [tgt_token] + pieces + ["</s>"]
 
-    def _translate_one(self, text: str) -> str:
-        original = safe_text(text)
-        if not original:
-            return ""
+        results = translator.translate_batch(
+            [source_tokens],
+            beam_size=max(1, self._beam_size),
+            max_decoding_length=256,
+            replace_unknowns=True,
+        )
 
-        idiomatic = self._idiomatic_translation(original)
-        if idiomatic:
-            return idiomatic
+        out_tokens = [
+            t for t in results[0].hypotheses[0] if t != tgt_token and t != "</s>"
+        ]
 
-        protected_text, placeholders = self._protect_terms(original)
         try:
-            translated = self._translate_cached(protected_text, self.source_lang, self.target_lang)
-        except Exception:
-            translated = protected_text
+            output_text = sp.decode(out_tokens)
+        except AttributeError:
+            output_text = sp.decode_pieces(out_tokens)
 
-        translated = self._restore_terms(translated, placeholders)
-        translated = normalize_translation_text(translated, self.target_lang)
-        translated = preserve_terminal_punctuation(original, translated, self.target_lang)
-        return translated or original
+        output_text = safe_text(output_text).strip()
 
-    def _idiomatic_translation(self, text: str) -> str:
-        if self.translation_style != "natural" or self.source_lang != "en" or self.target_lang != "pt":
-            return ""
+        if self.cache_enabled:
+            self._cache[cache_key] = output_text
 
-        body, punctuation = _split_terminal_punctuation(text)
-        key = safe_text(body).lower()
-        mapped = IDIOMATIC_MAP.get(key)
-        if not mapped:
-            return ""
-        return normalize_translation_text(mapped + punctuation, "pt")
-
-    def _protect_terms(self, text: str) -> tuple[str, dict[str, str]]:
-        placeholders: dict[str, str] = {}
-        protected = text
-
-        if self.source_lang == "en":
-            protected, placeholders = _protect_matches(protected, GLOSSARY.keys(), placeholders)
-            names = detect_proper_names(protected)
-            protected, placeholders = _protect_matches(protected, names, placeholders)
-            return protected, placeholders
-
-        if self.source_lang == "ja":
-            protected, placeholders = _protect_matches(protected, JA_HONORIFICS, placeholders)
-            return protected, placeholders
-
-        return protected, placeholders
-
-    @staticmethod
-    def _restore_terms(text: str, placeholders: dict[str, str]) -> str:
-        restored = safe_text(text)
-        for placeholder, value in placeholders.items():
-            restored = restored.replace(placeholder, value)
-            restored = restored.replace(placeholder.lower(), value)
-            restored = restored.replace(placeholder.replace("_", " "), value)
-        return restored
-
-    @staticmethod
-    def _normalize_style(value) -> str:
-        style = safe_text(value).lower()
-        if style == "literal":
-            return "literal"
-        return "natural"
-
-    @staticmethod
-    @lru_cache(maxsize=2048)
-    def _translate_cached(text: str, source_lang: str, target_lang: str) -> str:
-        try:
-            translator = GoogleTextTranslator._get_client(source_lang, target_lang)
-            translated = translator.translate(text)
-            return safe_text(translated) or text
-        except Exception:
-            return text
-
-    @classmethod
-    def _get_client(cls, source_lang: str, target_lang: str):
-        key = (source_lang, target_lang)
-        with cls._client_lock:
-            if key not in cls._client_cache:
-                from deep_translator import GoogleTranslator
-
-                cls._client_cache[key] = GoogleTranslator(source=source_lang, target=target_lang)
-            return cls._client_cache[key]
-
-
-def detect_proper_names(text: str) -> list[str]:
-    clean = safe_text(text)
-    if not clean:
-        return []
-
-    names: list[str] = []
-    for match in TITLE_NAME_RE.finditer(clean):
-        names.append(match.group(0))
-
-    for match in CAPITALIZED_RE.finditer(clean):
-        word = match.group(0)
-        if match.start() == 0 and word in COMMON_INITIAL_WORDS:
-            continue
-        if word in COMMON_INITIAL_WORDS:
-            continue
-        if word.upper() == word:
-            continue
-        names.append(word)
-
-    return _unique_by_length(names)
-
-
-def normalize_translation_text(text: str, target_lang: str) -> str:
-    normalized_target = resolve_translation_lang(target_lang)
-    if normalized_target == "pt":
-        return normalize_translation_pt(text)
-    return normalize_translation_en(text)
-
-
-def normalize_translation_pt(text: str) -> str:
-    clean = safe_text(text)
-    if not clean:
-        return ""
-
-    clean = clean.replace("…", "...")
-    clean = re.sub(r"\s+([,.;:!?])", r"\1", clean)
-    clean = re.sub(r"\s*\.\s*\.\s*\.", "...", clean)
-    clean = re.sub(r"\.{4,}", "...", clean)
-    clean = re.sub(r"!{3,}", "!!", clean)
-    clean = re.sub(r"\?{3,}", "??", clean)
-    clean = re.sub(r"\s+([!?]+)", r"\1", clean)
-    clean = re.sub(r"\s+", " ", clean)
-    return safe_text(clean)
-
-
-def normalize_translation_en(text: str) -> str:
-    clean = safe_text(text)
-    if not clean:
-        return ""
-
-    clean = clean.replace("…", "...")
-    clean = re.sub(r"\s+([,.;:!?])", r"\1", clean)
-    clean = re.sub(r"\s*\.\s*\.\s*\.", "...", clean)
-    clean = re.sub(r"\.{4,}", "...", clean)
-    clean = re.sub(r"!{3,}", "!!", clean)
-    clean = re.sub(r"\?{3,}", "??", clean)
-    clean = re.sub(r"\s+", " ", clean)
-    return safe_text(clean)
-
-
-def preserve_terminal_punctuation(source: str, translated: str, target_lang: str) -> str:
-    clean_translated = safe_text(translated)
-    if not clean_translated:
-        return ""
-
-    _, source_punctuation = _split_terminal_punctuation(source)
-    if not source_punctuation:
-        return clean_translated
-    if re.search(r"([!?.]+|\?!|!\?)$", clean_translated):
-        return clean_translated
-    return normalize_translation_text(clean_translated + source_punctuation, target_lang)
-
-
-def _protect_matches(text: str, values, placeholders: dict[str, str]) -> tuple[str, dict[str, str]]:
-    protected = text
-    for value in _unique_by_length([safe_text(item) for item in values if safe_text(item)]):
-        if value not in protected:
-            continue
-        placeholder = f"__NAME_{len(placeholders)}__"
-        protected = protected.replace(value, placeholder)
-        placeholders[placeholder] = value
-    return protected, placeholders
-
-
-def _unique_by_length(values: list[str]) -> list[str]:
-    seen = set()
-    unique = []
-    for value in sorted(values, key=len, reverse=True):
-        if value in seen:
-            continue
-        seen.add(value)
-        unique.append(value)
-    return unique
-
-
-def _split_terminal_punctuation(text: str) -> tuple[str, str]:
-    clean = safe_text(text)
-    if not clean:
-        return "", ""
-
-    for raw, mapped in ("！？", "?!"), ("？！", "?!"), ("。", "."), ("！", "!"), ("？", "?"), ("…", "..."):
-        if clean.endswith(raw):
-            return clean[: -len(raw)], mapped
-
-    match = re.search(r"([!?.]+|\?!|!\?)$", clean)
-    if not match:
-        return clean, ""
-    return clean[: match.start()], match.group(0)
+        return output_text

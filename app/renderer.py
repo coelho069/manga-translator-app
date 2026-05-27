@@ -36,18 +36,22 @@ class TextRenderer:
         self.last_shrink_reason: str = ""
 
     def render(self, image: np.ndarray, bubble: SpeechBubble) -> np.ndarray:
+        bubble.render_success = False
         text = safe_text(getattr(bubble, "translated_text", ""))
         if not text:
+            print(f"[RENDER_FAIL] balloon={bubble.id} reason=empty_translation")
             return image
 
         if safe_text(getattr(bubble, "source_text", "")) and not bool(getattr(bubble, "cleanup_success", False)):
             if hasattr(bubble, "processing_notes") and isinstance(bubble.processing_notes, list):
                 bubble.processing_notes.append("renderizacao ignorada: limpeza nao confirmada")
+            print(f"[RENDER_FAIL] balloon={bubble.id} reason=cleanup_not_confirmed")
             return image
 
         rect = self.get_safe_text_rect(bubble, image.shape)
         if rect is None:
             bubble.processing_notes.append("area segura pequena demais; texto nao renderizado")
+            print(f"[RENDER_FAIL] balloon={bubble.id} reason=safe_rect_unavailable")
             return image
 
         x, y, w, h = rect
@@ -60,6 +64,7 @@ class TextRenderer:
 
         if w < 12 or h < 12:
             bubble.processing_notes.append("area util pequena demais; texto nao renderizado")
+            print(f"[RENDER_FAIL] balloon={bubble.id} reason=safe_area_too_small w={w} h={h}")
             return image
 
         pil_image = cv2_to_pil(image)
@@ -75,14 +80,20 @@ class TextRenderer:
 
         if font is None or not lines:
             bubble.processing_notes.append("texto grande demais; texto nao renderizado")
+            print(
+                f"[RENDER_FAIL] balloon={bubble.id} reason=fit_failed area={w}x{h} "
+                f"detail={safe_text(self.last_shrink_reason) or 'no_size_fit'}"
+            )
             return image
 
         if total_height > h:
             bubble.processing_notes.append("altura final do texto excedeu o balao")
+            print(f"[RENDER_FAIL] balloon={bubble.id} reason=height_overflow total_h={total_height} area_h={h}")
             return image
 
         if any(self._text_width(draw, line, font) > w for line in lines):
             bubble.processing_notes.append("largura final do texto excedeu o balao")
+            print(f"[RENDER_FAIL] balloon={bubble.id} reason=width_overflow area_w={w}")
             return image
 
         center_text = bool(getattr(self.config, "center_text", True))
@@ -112,6 +123,10 @@ class TextRenderer:
 
             if current_y + line_height_real > y + h:
                 bubble.processing_notes.append("linha ultrapassaria area segura; renderizacao interrompida")
+                print(
+                    f"[RENDER_FAIL] balloon={bubble.id} reason=line_overflow_mid_draw "
+                    f"line_bottom={current_y + line_height_real} limit={y + h}"
+                )
                 return image
 
             if center_text:
@@ -144,6 +159,13 @@ class TextRenderer:
             result = self._contain_render_inside_mask(result, image, bubble)
 
         self._save_debug_images(bubble, image, result, x, y, w, h, lines, font, draw)
+
+        bubble.render_success = True
+        print(
+            f"[RENDER_FIT] balloon={bubble.id} "
+            f"font_size={self.last_font_size} lines={self.last_line_count} "
+            f"text={self.last_text_width}x{self.last_text_height} area={w}x{h}"
+        )
 
         return result
 
@@ -535,23 +557,8 @@ class TextRenderer:
                             self.last_shrink_reason = f"reduzido de {effective_max_font} para {size}px"
                         return font, lines, line_height, total_height
 
-                    clipped_lines = self._clip_lines_to_height(
-                        draw=draw,
-                        lines=lines,
-                        font=font,
-                        line_height=line_height,
-                        max_width=max_width,
-                        max_height=max_height,
-                    )
-
-                    if clipped_lines:
-                        total_height = line_height * len(clipped_lines)
-                        widest = max(self._text_width(draw, line, font) for line in clipped_lines)
-
-                        if widest <= max_width and total_height <= max_height:
-                            if size < effective_max_font:
-                                self.last_shrink_reason = f"reduzido de {effective_max_font} para {size}px + clip"
-                            return font, clipped_lines, line_height, total_height
+                    # Caminho de ellipsis desativado (regra: nao cortar texto).
+                    # Se nao couber neste size+width+spacing, tenta proxima combinacao.
 
         self.last_shrink_reason = f"nenhum tamanho coube (min={min_font_size}px, max={effective_max_font}px)"
         return None, [], 0, 0
