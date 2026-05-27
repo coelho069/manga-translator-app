@@ -11,3 +11,18 @@ runs/
 .pytest_cache/
 .streamlit/secrets.toml
 manga109-segmentation-bubble/
+
+# Secrets / credentials (never commit)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+credentials/
+token*
+*_token*
+*_key*
+
+# Runtime state (logs session keys + IPs; rotates per request)
+data/sessions.json

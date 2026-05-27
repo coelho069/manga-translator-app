@@ -7,7 +7,6 @@ import zipfile
 
 import streamlit as st
 
-from app.auth import require_auth
 from app.backend import create_batch_zip, process_batch, process_uploaded_image
 from app.pdf_utils import get_pdf_page_count, iter_pdf_pages
 from app.utils import ensure_dir, get_translation_mode_config, get_translation_mode_labels
@@ -160,7 +159,6 @@ def gather_inputs(uploaded_files, status_placeholder):
 
 
 st.set_page_config(page_title="Manga Translator", page_icon="📚", layout="centered")
-require_auth()
 init_state()
 
 st.title("Manga Translator")

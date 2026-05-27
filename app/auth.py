@@ -172,9 +172,7 @@ def render_key_panel() -> None:
                 expiration_days=expiration_days,
             )
             st.session_state["last_generated_key"] = new_key
-            print(f"[KEY] Gerada: {new_key}")
-            print(f"[KEY] expires_at: {get_key_status(new_key).get('expires_at')}")
-            print(f"[KEY] keys carregadas: {len(list_keys())}")
+            print(f"[KEY] generated: configured=true | keys_total={len(list_keys())}")
             _rerun()
 
         last_generated_key = st.session_state.get("last_generated_key")
@@ -224,7 +222,6 @@ def render_key_panel() -> None:
                 f"Status: {status_emoji} | "
                 f"IP: {entry.get('redeemed_ip') or '-'}"
             )
-            print(f"[KEY] {key} | status={status_emoji} | expires_at={entry.get('expires_at')} | keys carregadas={len(keys)}")
 
 
 def render_online_users_panel() -> None:
