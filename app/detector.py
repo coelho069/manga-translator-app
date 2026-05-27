@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-import json
 import shutil
 from pathlib import Path
+from time import perf_counter
 
 import cv2
 import numpy as np
 
 from app.config import AppConfig
+from app.hf_auth import hf_auth_help_message, hf_auth_kwargs, is_hf_auth_error
 from app.types import BoundingBox, SpeechBubble
 from app.utils import ensure_dir, write_image_cv2
 
@@ -23,34 +24,40 @@ class BubbleDetector:
 
         cache_key = (str(self.model_path.resolve()), bool(config.use_gpu), "segment")
         if cache_key not in BubbleDetector._model_cache:
-            print(f"[YOLO_BUBBLE] model_load_start path={self.model_path}")
+            print("[YOLO_BUBBLE] model_load_start")
+            print(f"[YOLO_BUBBLE] repo={self.config.hf_bubble_model_repo} file={self.config.hf_bubble_model_filename}")
             BubbleDetector._model_cache[cache_key] = YOLO(str(self.model_path), task="segment")
-            print(
-                f"[YOLO_BUBBLE] model_loaded repo={getattr(config, 'hf_bubble_model_repo', '')} "
-                f"task=segment"
-            )
+            print("[YOLO_BUBBLE] model_loaded")
+            print("[MODEL] YOLO carregado uma vez")
+        else:
+            print("[YOLO_BUBBLE] model_loaded")
+            print("[MODEL] YOLO cache reutilizado")
         self.model = BubbleDetector._model_cache[cache_key]
 
-    def detect(self, image: np.ndarray, page_label: str | int | None = None) -> list[SpeechBubble]:
+    def detect(self, image: np.ndarray, page_label: str = "") -> list[SpeechBubble]:
         if image is None or image.size == 0:
             return []
 
-        height, width = image.shape[:2]
-        page = page_label if page_label is not None else f"{width}x{height}"
+        page = page_label or "page"
         print(f"[YOLO_BUBBLE] detect_start page={page}")
+        height, width = image.shape[:2]
+        predict_start = perf_counter()
         results = self.model.predict(
             image,
             task="segment",
             imgsz=self.config.yolo_imgsz,
             conf=self.config.yolo_confidence,
             iou=self.config.yolo_iou,
+            max_det=max(1, int(getattr(self.config, "yolo_max_det", 60))),
             device="cpu" if not self.config.use_gpu else None,
             verbose=False,
         )
+        print(f"[PERF] yolo_predict={perf_counter() - predict_start:.4f}s")
 
         bubbles: list[SpeechBubble] = []
         if not results:
             self._save_detection_debug(image, bubbles)
+            print("[YOLO] baloes detectados: 0")
             print(f"[YOLO_BUBBLE] detected page={page} count=0")
             return bubbles
 
@@ -82,8 +89,9 @@ class BubbleDetector:
             if bbox is None:
                 continue
 
-            confidence = confidences[idx] if idx < len(confidences) else 0.0
-            bubble = SpeechBubble(id=0, bbox=bbox, mask=processed_mask, confidence=confidence)
+            bubble = SpeechBubble(id=0, bbox=bbox, mask=processed_mask)
+            if idx < len(confidences):
+                bubble.processing_notes.append(f"confidence={confidences[idx]:.3f}")
             if not has_mask:
                 bubble.processing_notes.append("fallback_bbox_sem_mascara")
             bubbles.append(bubble)
@@ -91,16 +99,15 @@ class BubbleDetector:
         bubbles.sort(key=lambda item: (item.bbox.y1, item.bbox.x1))
         for index, bubble in enumerate(bubbles, start=1):
             bubble.id = index
-            conf = f"{getattr(bubble, 'confidence', 0.0):.3f}"
-            mask_area = int(cv2.countNonZero(bubble.mask)) if bubble.mask is not None else 0
+            conf = self._confidence_from_notes(bubble.processing_notes)
+            conf_text = f"{conf:.3f}" if conf is not None else "unknown"
             print(
-                f"[BALLOON] index={bubble.id} "
-                f"bbox=({bubble.bbox.x1},{bubble.bbox.y1},{bubble.bbox.x2},{bubble.bbox.y2}) "
-                f"conf={conf}"
+                f"[YOLO_BUBBLE] balloon={bubble.id} "
+                f"bbox={bubble.bbox.x1},{bubble.bbox.y1},{bubble.bbox.x2},{bubble.bbox.y2} conf={conf_text}"
             )
-            print(f"[BALLOON_MASK] index={bubble.id} mask_area={mask_area}")
 
         self._save_detection_debug(image, bubbles)
+        print(f"[YOLO] baloes detectados: {len(bubbles)}")
         print(f"[YOLO_BUBBLE] detected page={page} count={len(bubbles)}")
         return bubbles
 
@@ -115,6 +122,7 @@ class BubbleDetector:
                 "Coloque o arquivo bubble_seg.pt dentro da pasta models/."
             )
 
+        print("[YOLO_BUBBLE] model_load_start")
         print(f"[HF] baixando modelo {self.config.hf_bubble_model_repo}...")
         try:
             from huggingface_hub import hf_hub_download
@@ -124,10 +132,16 @@ class BubbleDetector:
                 "Execute: python -m pip install -r requirements.txt"
             ) from exc
 
-        cached_path = hf_hub_download(
-            repo_id=self.config.hf_bubble_model_repo,
-            filename=self.config.hf_bubble_model_filename,
-        )
+        try:
+            cached_path = hf_hub_download(
+                repo_id=self.config.hf_bubble_model_repo,
+                filename=self.config.hf_bubble_model_filename,
+                **hf_auth_kwargs(),
+            )
+        except Exception as exc:
+            if is_hf_auth_error(exc):
+                raise RuntimeError(hf_auth_help_message(self.config.hf_bubble_model_repo)) from exc
+            raise
         ensure_dir(model_path.parent)
         shutil.copy2(cached_path, model_path)
         print(f"[HF] modelo salvo em {model_path}")
@@ -222,6 +236,10 @@ class BubbleDetector:
         return mask
 
     def _save_detection_debug(self, image: np.ndarray, bubbles: list[SpeechBubble]) -> None:
+        if not bool(getattr(self.config, "debug_enabled", False)):
+            return
+        import json
+
         output_dir = ensure_dir(self.config.output_dir)
         debug_detection = image.copy()
         debug_masks = image.copy()
@@ -259,7 +277,7 @@ class BubbleDetector:
                         "y2": bubble.bbox.y2,
                     },
                     "area": int(cv2.countNonZero(bubble.mask)),
-                    "confidence": float(getattr(bubble, "confidence", 0.0)),
+                    "confidence": self._confidence_from_notes(bubble.processing_notes),
                     "has_mask": "fallback_bbox_sem_mascara" not in bubble.processing_notes,
                     "notes": list(bubble.processing_notes),
                 }

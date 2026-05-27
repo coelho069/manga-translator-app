@@ -3,6 +3,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+def _env(name: str, default: str) -> str:
+    value = os.getenv(name)
+    return value if value not in (None, "") else default
+
+
 @dataclass(frozen=True)
 class AppConfig:
     bubble_model_path: Path = Path("models/bubble_seg.pt")
@@ -10,23 +15,26 @@ class AppConfig:
     hf_bubble_model_filename: str = "model.pt"
     auto_download_bubble_model: bool = True
     output_dir: Path = Path("output")
-    translation_provider: str = os.getenv("TRANSLATION_PROVIDER", "m2m100")
-    translation_model: str = os.getenv("TRANSLATION_MODEL", "facebook/m2m100_418M")
-    translation_cache_enabled: bool = os.getenv("TRANSLATION_CACHE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
-    translation_timeout_seconds: int = int(os.getenv("TRANSLATION_TIMEOUT_SECONDS", "180"))
-    translation_beam_size: int = 4
-    translation_mode: str = "en_to_pt"
-    source_lang: str = os.getenv("DEFAULT_SOURCE_LANG", "auto")
-    target_lang: str = os.getenv("DEFAULT_TARGET_LANG", "pt")
-    ocr_lang: str = "en"
+    translation_flow: str = _env("DEFAULT_TRANSLATION_FLOW", "auto_to_en")
+    translation_provider: str = _env("TRANSLATION_PROVIDER", "multilingual")
+    hf_translation_model: str = _env("TRANSLATION_MODEL", _env("HF_TRANSLATION_MODEL", "facebook/m2m100_418M"))
+    translation_refiner_enabled: bool = False
+    source_lang: str = _env("DEFAULT_SOURCE_LANG", "auto")
+    target_lang: str = _env("DEFAULT_TARGET_LANG", "en")
+    ocr_lang: str = _env("OCR_LANG", "japan")
+    ocr_engine: str = "auto"
+    manga_ocr_model_name: str = "kha-white/manga-ocr-base"
+    manga_ocr_cache_dir: str = "models/huggingface"
+    manga_ocr_device: str = "cpu"
     translation_style: str = "natural"
     performance_mode: str = "balanced"
     yolo_confidence: float = 0.20
     yolo_iou: float = 0.50
     yolo_imgsz: int = 960
-    bubble_erode_px: int = 8
-    text_mask_dilate_px: int = 15
-    render_margin_px: int = 14
+    yolo_max_det: int = 60
+    bubble_erode_px: int = 4
+    text_mask_dilate_px: int = 10
+    render_margin_px: int = 10
     translation_font_scale: float = 1.0
     min_font_size: int = 9
     max_font_size: int = 32
@@ -47,25 +55,17 @@ class AppConfig:
     max_cleanup_mask_ratio: float = 0.65
     min_text_component_area: int = 4
     max_text_component_area_ratio: float = 0.12
-    cleanup_morph_close_px: int = 5
-    cleanup_extra_dilate_px: int = 5
+    cleanup_morph_close_px: int = 7
+    cleanup_extra_dilate_px: int = 3
     cleaner_mode: str = "white_fill"
     force_clean_on_failed_mask: bool = True
     inner_white_fill_on_failed_cleanup: bool = True
     line_spacing_ratio: float = 1.12
     font_shrink_step: int = 1
     max_render_font_attempts: int = 28
-    text_padding_px: int = 8
+    text_padding_px: int = 6
     draw_text_outline: bool = False
     text_color: tuple[int, int, int] = (0, 0, 0)
     outline_color: tuple[int, int, int] = (255, 255, 255)
-    auto_font_resize: bool = True
-    center_text: bool = True
-    bold_text: bool = False
-    cleanup_feather_px: int = 2
-    residual_dark_threshold: int = 100
-    residual_min_component_area: int = 6
-    residual_max_component_ratio: float = 0.04
-    residual_max_ratio: float = 0.025
     debug_enabled: bool = False
     debug_dir: Path | None = None

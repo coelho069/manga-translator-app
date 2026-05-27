@@ -49,9 +49,6 @@ class SpeechBubble:
     id: int
     bbox: BoundingBox
     mask: np.ndarray | None = None
-    confidence: float = 0.0
-    ocr_bbox: BoundingBox | None = None
-    render_bbox: BoundingBox | None = None
     source_text: str = ""
     translated_text: str = ""
     ocr_boxes: list[OCRTextBox] = field(default_factory=list)

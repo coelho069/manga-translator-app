@@ -2,70 +2,69 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
 
 import cv2
 import numpy as np
-from PIL import ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont
 
 from app.config import AppConfig
 from app.types import SpeechBubble
-from app.utils import cv2_to_pil, pil_to_cv2, safe_text, write_image_cv2
+from app.utils import cv2_to_pil, pil_to_cv2, safe_text
 
 
 class TextRenderer:
     """
-    Renderiza o texto traduzido dentro do balao com:
-    - area segura centralizada
-    - uso da mascara do balao quando disponivel
+    Renderiza o texto traduzido dentro do balão com:
+    - área segura centralizada
+    - uso da máscara do balão quando disponível
     - quebra de linha inteligente
-    - reducao automatica da fonte
-    - centralizacao horizontal e vertical
-    - fallback com reticencias quando o texto ainda for grande demais
-    - verificacao de mascara de limpeza antes de renderizar
-    - contencao total do texto dentro do balao
+    - redução automática da fonte
+    - centralização horizontal e vertical
+    - fallback com reticências quando o texto ainda for grande demais
     """
 
     def __init__(self, config: AppConfig):
         self.config = config
-        self.debug_dir: Path | None = None
-        self.last_font_size: int = 0
-        self.last_line_count: int = 0
-        self.last_text_width: int = 0
-        self.last_text_height: int = 0
-        self.last_shrink_reason: str = ""
+        self._occupied_mask: np.ndarray | None = None
+        self._bubble_context: list[SpeechBubble] = []
+
+    def set_bubble_context(self, bubbles: list[SpeechBubble]) -> None:
+        self._bubble_context = list(bubbles or [])
+
+    def reset_occupancy(self, image_shape) -> None:
+        self._occupied_mask = np.zeros(image_shape[:2], dtype=np.uint8)
 
     def render(self, image: np.ndarray, bubble: SpeechBubble) -> np.ndarray:
         bubble.render_success = False
         text = safe_text(getattr(bubble, "translated_text", ""))
+        bbox_text = f"{bubble.bbox.x1},{bubble.bbox.y1},{bubble.bbox.x2},{bubble.bbox.y2}"
+        print(f"[RENDER_INPUT] balloon={bubble.id} text=\"{text}\" bbox={bbox_text}")
         if not text:
-            print(f"[RENDER_FAIL] balloon={bubble.id} reason=empty_translation")
+            self._render_fail(bubble, "texto traduzido vazio")
             return image
+        print(f"[RENDERER] desenhando balao {bubble.id}")
+        print(f"[RENDERER] desenhando traducao no balao {bubble.id}")
+        print(f"[RENDERER] texto={text}")
+        if self._occupied_mask is None or self._occupied_mask.shape != image.shape[:2]:
+            self.reset_occupancy(image.shape)
 
-        if safe_text(getattr(bubble, "source_text", "")) and not bool(getattr(bubble, "cleanup_success", False)):
-            if hasattr(bubble, "processing_notes") and isinstance(bubble.processing_notes, list):
-                bubble.processing_notes.append("renderizacao ignorada: limpeza nao confirmada")
-            print(f"[RENDER_FAIL] balloon={bubble.id} reason=cleanup_not_confirmed")
-            return image
+        if bubble.bbox.width <= 5 or bubble.bbox.height <= 5:
+            return self._fallback_render(image, bubble, "bbox invalido ou pequeno demais")
 
         rect = self.get_safe_text_rect(bubble, image.shape)
         if rect is None:
-            bubble.processing_notes.append("area segura pequena demais; texto nao renderizado")
-            print(f"[RENDER_FAIL] balloon={bubble.id} reason=safe_rect_unavailable")
-            return image
+            return self._fallback_render(image, bubble, "area segura pequena demais; texto nao renderizado")
 
         x, y, w, h = rect
 
-        padding = max(0, int(getattr(self.config, "text_padding_px", 8)))
+        padding = max(0, min(8, int(getattr(self.config, "text_padding_px", 8))))
         x += padding
         y += padding
         w -= padding * 2
         h -= padding * 2
 
-        if w < 12 or h < 12:
-            bubble.processing_notes.append("area util pequena demais; texto nao renderizado")
-            print(f"[RENDER_FAIL] balloon={bubble.id} reason=safe_area_too_small w={w} h={h}")
-            return image
+        if w <= 5 or h <= 5:
+            return self._fallback_render(image, bubble, "area util pequena demais; texto nao renderizado")
 
         pil_image = cv2_to_pil(image)
         draw = ImageDraw.Draw(pil_image)
@@ -79,61 +78,42 @@ class TextRenderer:
         )
 
         if font is None or not lines:
-            bubble.processing_notes.append("texto grande demais; texto nao renderizado")
-            print(
-                f"[RENDER_FAIL] balloon={bubble.id} reason=fit_failed area={w}x{h} "
-                f"detail={safe_text(self.last_shrink_reason) or 'no_size_fit'}"
-            )
-            return image
+            return self._fallback_render(image, bubble, "texto grande demais ou fonte compativel ausente; texto nao renderizado")
+
+        font_size = max(8, int(getattr(font, "size", 8) or 8))
+        print(f"[RENDER_VALIDATE] balloon={bubble.id} width={w} height={h} font_size={font_size} lines={len(lines)}")
 
         if total_height > h:
-            bubble.processing_notes.append("altura final do texto excedeu o balao")
-            print(f"[RENDER_FAIL] balloon={bubble.id} reason=height_overflow total_h={total_height} area_h={h}")
-            return image
+            return self._fallback_render(image, bubble, "altura final do texto excedeu o balao")
 
         if any(self._text_width(draw, line, font) > w for line in lines):
-            bubble.processing_notes.append("largura final do texto excedeu o balao")
-            print(f"[RENDER_FAIL] balloon={bubble.id} reason=width_overflow area_w={w}")
-            return image
+            return self._fallback_render(image, bubble, "largura final do texto excedeu o balao")
 
-        center_text = bool(getattr(self.config, "center_text", True))
-        if center_text:
-            current_y = y + max(0, (h - total_height) // 2)
-        else:
-            current_y = y
-
-        widest = max(self._text_width(draw, line, font) for line in lines)
-
-        self.last_font_size = getattr(font, "size", 0) if hasattr(font, "size") else 0
-        self.last_line_count = len(lines)
-        self.last_text_width = widest
-        self.last_text_height = total_height
-
-        print(f"[RENDERER] Bubble {bubble.id}: font_size={self.last_font_size}px, "
-              f"lines={self.last_line_count}, "
-              f"text={self.last_text_width}x{self.last_text_height}px, "
-              f"area={w}x{h}px")
-        if self.last_shrink_reason:
-            print(f"[RENDERER] Bubble {bubble.id}: motivo reducao: {self.last_shrink_reason}")
-
+        current_y = y + max(0, (h - total_height) // 2)
+        planned_lines: list[tuple[int, int, str]] = []
         for line in lines:
             line_bbox = draw.textbbox((0, 0), line, font=font)
             line_width = line_bbox[2] - line_bbox[0]
             line_height_real = line_bbox[3] - line_bbox[1]
 
             if current_y + line_height_real > y + h:
-                bubble.processing_notes.append("linha ultrapassaria area segura; renderizacao interrompida")
-                print(
-                    f"[RENDER_FAIL] balloon={bubble.id} reason=line_overflow_mid_draw "
-                    f"line_bottom={current_y + line_height_real} limit={y + h}"
-                )
-                return image
+                return self._fallback_render(image, bubble, "linha ultrapassaria area segura; renderizacao interrompida")
 
-            if center_text:
-                line_x = x + max(0, (w - line_width) // 2)
-            else:
-                line_x = x
+            line_x = x + max(0, (w - line_width) // 2)
 
+            planned_lines.append((line_x, current_y, line))
+            current_y += line_height
+
+        text_mask = self._text_mask_for_lines(image.shape, planned_lines, font)
+        safe_mask = self._safe_mask_for_bubble(bubble, image.shape)
+        if not self._text_mask_inside_safe_area(text_mask, safe_mask):
+            return self._fallback_render(image, bubble, "texto ultrapassaria area segura; renderizacao bloqueada")
+        if self._occupied_mask is not None and cv2.countNonZero(cv2.bitwise_and(text_mask, self._occupied_mask)) > 0:
+            return self._fallback_render(image, bubble, "texto colide com outra traducao; renderizacao bloqueada")
+
+        print(f"[RENDERER] font_size={getattr(font, 'size', 'default')}")
+        print(f"[RENDER_DRAW] balloon={bubble.id} x={x} y={y} font_size={font_size} lines={len(planned_lines)}")
+        for line_x, current_y, line in planned_lines:
             if bool(getattr(self.config, "draw_text_outline", False)):
                 draw.text(
                     (line_x, current_y),
@@ -151,113 +131,105 @@ class TextRenderer:
                     font=font,
                 )
 
+        if self._occupied_mask is not None:
+            self._occupied_mask[text_mask > 0] = 255
+        bubble.render_success = True
+        print("[RENDERER] sucesso")
+        print(f"[RENDER_SUCCESS] balloon={bubble.id}")
+
+        return pil_to_cv2(pil_image)
+
+    @staticmethod
+    def _render_fail(bubble: SpeechBubble, reason: str) -> None:
+        if hasattr(bubble, "processing_notes") and isinstance(bubble.processing_notes, list):
+            bubble.processing_notes.append(reason)
+        print(f"[RENDERER] falhou balao {getattr(bubble, 'id', '?')}: {reason}")
+        print(f"[RENDER_FAIL] balloon={getattr(bubble, 'id', '?')} reason={reason}")
+
+    def _fallback_render(self, image: np.ndarray, bubble: SpeechBubble, reason: str) -> np.ndarray:
+        print(f"[RENDER_FALLBACK] balloon={bubble.id} reason={reason}")
+        text = safe_text(getattr(bubble, "translated_text", ""))
+        if not text or image is None or image.size == 0:
+            self._render_fail(bubble, reason)
+            return image
+
+        image_h, image_w = image.shape[:2]
+        margin = 4
+        x = max(0, min(image_w - 1, int(bubble.bbox.x1) + margin))
+        y = max(0, min(image_h - 1, int(bubble.bbox.y1) + margin))
+        x2 = max(x + 1, min(image_w, int(bubble.bbox.x2) - margin))
+        y2 = max(y + 1, min(image_h, int(bubble.bbox.y2) - margin))
+        w = x2 - x
+        h = y2 - y
+        if w <= 5 or h <= 5:
+            self._render_fail(bubble, "fallback sem bbox valido")
+            return image
+
+        pil_image = cv2_to_pil(image)
+        draw = ImageDraw.Draw(pil_image)
+        font_size = max(8, min(24, int(h * 0.22), int(w * 0.16)))
+        font = None
+        lines: list[str] = []
+        line_height = 0
+        total_height = 0
+
+        for size in range(font_size, 7, -1):
+            font = self._load_font(
+                size=size,
+                target_lang=safe_text(getattr(self.config, "target_lang", "")),
+                sample_text=text,
+                preferred_font=safe_text(getattr(self.config, "font_path", "")),
+            ) or ImageFont.load_default()
+            lines = self._wrap_text(draw, text, font, max(6, w))
+            if not lines:
+                lines = [self._ellipsis(draw, text, font, max(6, w))]
+            line_height = self._line_height(draw, font, 1.0)
+            max_lines = max(1, h // max(1, line_height))
+            if len(lines) > max_lines:
+                lines = lines[:max_lines]
+                lines[-1] = self._ellipsis(draw, lines[-1], font, max(6, w))
+            total_height = line_height * len(lines)
+            if lines and total_height <= h and all(self._text_width(draw, line, font) <= w for line in lines):
+                font_size = size
+                break
+
+        if font is None or not lines:
+            self._render_fail(bubble, "fallback nao conseguiu fonte/linhas")
+            return image
+
+        print(f"[RENDER_VALIDATE] balloon={bubble.id} width={w} height={h} font_size={font_size} lines={len(lines)}")
+        current_y = max(y, min(y2 - 1, y + max(0, (h - total_height) // 2)))
+        drawn_lines = 0
+        for line in lines:
+            line = self._ellipsis(draw, line, font, w)
+            if not line:
+                continue
+            line_width = self._text_width(draw, line, font)
+            line_x = max(x, min(x2 - 1, x + max(0, (w - line_width) // 2)))
+            if current_y >= y2:
+                break
+            draw.text((line_x, current_y), line, fill=(0, 0, 0), font=font)
+            drawn_lines += 1
             current_y += line_height
 
-        result = pil_to_cv2(pil_image)
+        if drawn_lines <= 0:
+            self._render_fail(bubble, "fallback nao desenhou linhas")
+            return image
 
-        if getattr(bubble, "mask", None) is not None and bubble.mask.size > 0:
-            result = self._contain_render_inside_mask(result, image, bubble)
-
-        self._save_debug_images(bubble, image, result, x, y, w, h, lines, font, draw)
-
+        print(f"[RENDER_DRAW] balloon={bubble.id} x={x} y={y} font_size={font_size} lines={drawn_lines}")
         bubble.render_success = True
-        print(
-            f"[RENDER_FIT] balloon={bubble.id} "
-            f"font_size={self.last_font_size} lines={self.last_line_count} "
-            f"text={self.last_text_width}x{self.last_text_height} area={w}x{h}"
-        )
-
-        return result
-
-    def _save_debug_images(
-        self,
-        bubble: SpeechBubble,
-        original: np.ndarray,
-        rendered: np.ndarray,
-        x: int,
-        y: int,
-        w: int,
-        h: int,
-        lines: list[str],
-        font,
-        draw: ImageDraw.ImageDraw,
-    ) -> None:
-        if self.debug_dir is None:
-            return
-
-        debug_layout = rendered.copy()
-        cv2.rectangle(debug_layout, (x, y), (x + w, y + h), (0, 200, 0), 1)
-        cv2.rectangle(debug_layout, (x - 2, y - 2), (x + w + 2, y + h + 2), (0, 0, 255), 1)
-
-        text_bottom = y
-        for line in lines:
-            line_bbox = draw.textbbox((0, 0), line, font=font)
-            lh = line_bbox[3] - line_bbox[1]
-            text_bottom += lh
-        cv2.line(debug_layout, (x, text_bottom), (x + w, text_bottom), (255, 0, 0), 1)
-
-        write_image_cv2(Path(self.debug_dir) / "debug_text_layout.png", debug_layout)
-
-        debug_font = rendered.copy()
-        font_info = f"font:{self.last_font_size}px lines:{self.last_line_count} size:{self.last_text_width}x{self.last_text_height}"
-        cv2.putText(
-            debug_font,
-            font_info,
-            (max(5, x), max(15, y - 8)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.4,
-            (0, 0, 255),
-            1,
-            cv2.LINE_AA,
-        )
-        write_image_cv2(Path(self.debug_dir) / "debug_font_size.png", debug_font)
-
-        debug_box = original.copy()
-        cv2.rectangle(debug_box, (bubble.bbox.x1, bubble.bbox.y1), (bubble.bbox.x2, bubble.bbox.y2), (0, 180, 0), 2)
-        cv2.rectangle(debug_box, (x, y), (x + w, y + h), (0, 0, 255), 1)
-        write_image_cv2(Path(self.debug_dir) / "debug_text_box.png", debug_box)
-
-    def _contain_render_inside_mask(
-        self,
-        rendered: np.ndarray,
-        original: np.ndarray,
-        bubble: SpeechBubble,
-    ) -> np.ndarray:
-        """Ensure rendered text stays inside the bubble mask."""
-        mask = bubble.mask
-        if mask is None or mask.size == 0:
-            return rendered
-
-        h, w = rendered.shape[:2]
-        mask_h, mask_w = mask.shape[:2]
-
-        if mask_h != h or mask_w != w:
-            return rendered
-
-        inner_mask = (mask > 0).astype(np.uint8)
-        erode_radius = max(1, int(getattr(self.config, "bubble_erode_px", 8)) // 2)
-        kernel_size = erode_radius * 2 + 1
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-        inner_mask = cv2.erode(inner_mask, kernel, iterations=1)
-
-        outside_mask = (inner_mask == 0).astype(np.uint8)
-
-        if cv2.countNonZero(outside_mask) == 0:
-            return rendered
-
-        result = rendered.copy()
-        result[outside_mask > 0] = original[outside_mask > 0]
-        return result
+        print(f"[RENDER_SUCCESS] balloon={bubble.id}")
+        return pil_to_cv2(pil_image)
 
     def get_safe_text_rect(self, bubble: SpeechBubble, image_shape) -> tuple[int, int, int, int] | None:
         """
-        Retorna uma area central segura para o texto.
+        Retorna uma área central segura para o texto.
 
         Importante:
-        Para baloes ovais ou irregulares, usar apenas o bounding box pode deixar
-        o texto sair visualmente do balao nos cantos. Por isso, quando existe
-        mascara, esta funcao tenta encontrar um retangulo central com alta
-        cobertura dentro da mascara.
+        Para balões ovais ou irregulares, usar apenas o bounding box pode deixar
+        o texto sair visualmente do balão nos cantos. Por isso, quando existe
+        máscara, esta função tenta encontrar um retângulo central com alta
+        cobertura dentro da máscara.
         """
 
         image_h, image_w = image_shape[:2]
@@ -266,7 +238,7 @@ class TextRenderer:
         min_h = max(12, int(getattr(self.config, "min_bubble_height", 20)) // 2)
 
         if getattr(bubble, "mask", None) is not None and bubble.mask.size > 0:
-            rect = self._safe_rect_from_mask(bubble.mask, image_w, image_h, min_w, min_h)
+            rect = self._safe_rect_from_mask(bubble.mask, image_w, image_h, min_w, min_h, bubble)
             if rect is not None:
                 return rect
 
@@ -279,6 +251,7 @@ class TextRenderer:
         image_h: int,
         min_w: int,
         min_h: int,
+        bubble: SpeechBubble,
     ) -> tuple[int, int, int, int] | None:
         base_mask = np.zeros((image_h, image_w), dtype=np.uint8)
 
@@ -302,6 +275,7 @@ class TextRenderer:
 
         for radius in erosion_candidates:
             safe_mask = self._erode_mask(base_mask, radius)
+            safe_mask = self._exclude_other_bubbles(safe_mask, bubble)
             if cv2.countNonZero(safe_mask) == 0:
                 continue
 
@@ -340,6 +314,8 @@ class TextRenderer:
         center_x = x + int(max_loc[0])
         center_y = y + int(max_loc[1])
 
+        # Escalas conservadoras. Em balões ovais, uma área central menor
+        # é mais confiável do que usar o bbox inteiro.
         scale_candidates = [
             (0.78, 0.64),
             (0.72, 0.70),
@@ -409,6 +385,7 @@ class TextRenderer:
 
             coverage = cv2.countNonZero(roi) / float(w * h)
 
+            # 0.96 evita usar cantos fora de balões ovais/irregulares.
             if coverage >= 0.96:
                 return x, y, w, h
 
@@ -460,6 +437,72 @@ class TextRenderer:
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
         return cv2.erode(mask, kernel, iterations=1)
 
+    def _safe_mask_for_bubble(self, bubble: SpeechBubble, image_shape) -> np.ndarray:
+        image_h, image_w = image_shape[:2]
+        mask = np.zeros((image_h, image_w), dtype=np.uint8)
+        raw = getattr(bubble, "mask", None)
+        margin = max(0, int(getattr(self.config, "render_margin_px", 10)))
+        if raw is not None and raw.size > 0:
+            h = min(image_h, raw.shape[0])
+            w = min(image_w, raw.shape[1])
+            mask[:h, :w] = (raw[:h, :w] > 0).astype(np.uint8) * 255
+            eroded = self._erode_mask(mask, margin)
+            mask = eroded if cv2.countNonZero(eroded) > 0 else mask
+        else:
+            x1 = max(0, bubble.bbox.x1 + margin)
+            y1 = max(0, bubble.bbox.y1 + margin)
+            x2 = min(image_w, bubble.bbox.x2 - margin)
+            y2 = min(image_h, bubble.bbox.y2 - margin)
+            if x2 > x1 and y2 > y1:
+                mask[y1:y2, x1:x2] = 255
+        return self._exclude_other_bubbles(mask, bubble)
+
+    def _exclude_other_bubbles(self, mask: np.ndarray, bubble: SpeechBubble) -> np.ndarray:
+        if mask is None or mask.size == 0 or not self._bubble_context:
+            return mask
+        safe = mask.copy()
+        shape = safe.shape[:2]
+        other_mask = np.zeros(shape, dtype=np.uint8)
+        for other in self._bubble_context:
+            if other is bubble or getattr(other, "id", None) == getattr(bubble, "id", None):
+                continue
+            raw = getattr(other, "mask", None)
+            if raw is not None and raw.size > 0:
+                h = min(shape[0], raw.shape[0])
+                w = min(shape[1], raw.shape[1])
+                other_mask[:h, :w] = cv2.bitwise_or(other_mask[:h, :w], ((raw[:h, :w] > 0).astype(np.uint8) * 255))
+            else:
+                margin = max(1, int(getattr(self.config, "bubble_erode_px", 8)) // 2)
+                x1 = max(0, other.bbox.x1 + margin)
+                y1 = max(0, other.bbox.y1 + margin)
+                x2 = min(shape[1], other.bbox.x2 - margin)
+                y2 = min(shape[0], other.bbox.y2 - margin)
+                if x2 > x1 and y2 > y1:
+                    other_mask[y1:y2, x1:x2] = 255
+        if cv2.countNonZero(other_mask) == 0:
+            return safe
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        other_mask = cv2.dilate(other_mask, kernel, iterations=1)
+        safe[other_mask > 0] = 0
+        return safe
+
+    @staticmethod
+    def _text_mask_inside_safe_area(text_mask: np.ndarray, safe_mask: np.ndarray) -> bool:
+        if cv2.countNonZero(text_mask) == 0 or cv2.countNonZero(safe_mask) == 0:
+            return False
+        outside = text_mask.copy()
+        outside[safe_mask > 0] = 0
+        return cv2.countNonZero(outside) == 0
+
+    def _text_mask_for_lines(self, image_shape, line_positions: list[tuple[int, int, str]], font) -> np.ndarray:
+        height, width = image_shape[:2]
+        mask_image = Image.new("L", (width, height), 0)
+        draw = ImageDraw.Draw(mask_image)
+        stroke_width = 1 if bool(getattr(self.config, "draw_text_outline", False)) else 0
+        for x, y, line in line_positions:
+            draw.text((x, y), line, fill=255, font=font, stroke_width=stroke_width, stroke_fill=255)
+        return np.array(mask_image, dtype=np.uint8)
+
     @staticmethod
     def _rect_from_mask(mask: np.ndarray) -> tuple[int, int, int, int] | None:
         coords = cv2.findNonZero(mask)
@@ -496,41 +539,26 @@ class TextRenderer:
         min_font_size, _ = self._scaled_font_bounds()
         step = max(1, int(getattr(self.config, "font_shrink_step", 1)))
         effective_max_font = self._effective_max_font_size(bubble, max_width, max_height)
-        auto_resize = bool(getattr(self.config, "auto_font_resize", True))
 
         spacing_candidates = self._spacing_candidates()
         max_attempts = int(getattr(self.config, "max_render_font_attempts", 0) or 0)
         attempts = 0
-        self.last_shrink_reason = ""
-
-        if not auto_resize:
-            font = self._load_font(effective_max_font)
-            target_width = max_width
-            lines = self._wrap_text(draw, text, font, target_width)
-            if lines:
-                lines = self._balance_lines(draw, lines, font, target_width)
-                spacing_ratio = spacing_candidates[0] if spacing_candidates else 1.12
-                line_height = self._line_height(draw, font, spacing_ratio)
-                total_height = line_height * len(lines)
-                widest = max(self._text_width(draw, line, font) for line in lines)
-
-                if widest <= max_width and total_height <= max_height:
-                    return font, lines, line_height, total_height
-
-                self.last_shrink_reason = "auto_font_resize=False, texto nao cabe"
-                return None, [], 0, 0
-
-            self.last_shrink_reason = "auto_font_resize=False, wrap falhou"
-            return None, [], 0, 0
 
         for size in range(effective_max_font, min_font_size - 1, -step):
             attempts += 1
             if max_attempts and attempts > max_attempts:
-                self.last_shrink_reason = f"max tentativas ({max_attempts}) atingido"
                 break
 
-            font = self._load_font(size)
+            font = self._load_font(
+                size=size,
+                target_lang=safe_text(getattr(self.config, "target_lang", "")),
+                sample_text=text,
+                preferred_font=safe_text(getattr(self.config, "font_path", "")),
+            )
+            if font is None:
+                continue
 
+            # Testa múltiplas larguras-alvo para melhorar a centralização visual.
             target_width_candidates = (
                 max_width,
                 int(max_width * 0.92),
@@ -553,14 +581,24 @@ class TextRenderer:
                     widest = max(self._text_width(draw, line, font) for line in lines)
 
                     if widest <= max_width and total_height <= max_height:
-                        if size < effective_max_font:
-                            self.last_shrink_reason = f"reduzido de {effective_max_font} para {size}px"
                         return font, lines, line_height, total_height
 
-                    # Caminho de ellipsis desativado (regra: nao cortar texto).
-                    # Se nao couber neste size+width+spacing, tenta proxima combinacao.
+                    clipped_lines = self._clip_lines_to_height(
+                        draw=draw,
+                        lines=lines,
+                        font=font,
+                        line_height=line_height,
+                        max_width=max_width,
+                        max_height=max_height,
+                    )
 
-        self.last_shrink_reason = f"nenhum tamanho coube (min={min_font_size}px, max={effective_max_font}px)"
+                    if clipped_lines:
+                        total_height = line_height * len(clipped_lines)
+                        widest = max(self._text_width(draw, line, font) for line in clipped_lines)
+
+                        if widest <= max_width and total_height <= max_height:
+                            return font, clipped_lines, line_height, total_height
+
         return None, [], 0, 0
 
     def _effective_max_font_size(self, bubble: SpeechBubble, max_width: int, max_height: int) -> int:
@@ -584,40 +622,199 @@ class TextRenderer:
         scaled_cap = max(1, int(round(cap * scale)))
         return max(scaled_min, min(scaled_max, scaled_cap))
 
-    def _load_font(self, size: int):
-        bold = bool(getattr(self.config, "bold_text", False))
-        return self._load_font_cached(size, bold)
+    @classmethod
+    @lru_cache(maxsize=256)
+    def _load_font(cls, size: int, target_lang: str = "", sample_text: str = "", preferred_font: str = ""):
+        font_path = cls.resolve_font_for_language(target_lang, preferred_font, sample_text)
+        if font_path:
+            try:
+                return ImageFont.truetype(font_path, size=size)
+            except OSError:
+                print(f"[FONT] falha ao carregar fonte: {font_path}")
 
-    @staticmethod
-    @lru_cache(maxsize=192)
-    def _load_font_cached(size: int, bold: bool = False):
-        if bold:
-            font_candidates = (
-                "arialbd.ttf",
-                "Arial Bold.ttf",
-                "Arial-Bold.ttf",
-                "DejaVuSans-Bold.ttf",
-                "LiberationSans-Bold.ttf",
-                "arial.ttf",
-                "Arial.ttf",
-                "DejaVuSans.ttf",
-                "LiberationSans-Regular.ttf",
-            )
-        else:
-            font_candidates = (
-                "arial.ttf",
-                "Arial.ttf",
-                "DejaVuSans.ttf",
-                "DejaVuSans-Bold.ttf",
-                "LiberationSans-Regular.ttf",
-            )
+        if cls._contains_cjk(sample_text) or cls._is_cjk_language(target_lang):
+            print("[FONT] nenhuma fonte CJK compativel encontrada; texto CJK nao deve ser renderizado com fonte padrao")
+            return None
 
-        for font_name in font_candidates:
+        for font_name in cls._latin_font_candidates():
             try:
                 return ImageFont.truetype(font_name, size=size)
             except OSError:
                 continue
         return ImageFont.load_default()
+
+    @classmethod
+    def resolve_font_for_language(cls, target_lang: str, preferred_font: str = "", sample_text: str = "") -> str | None:
+        target = safe_text(target_lang).lower()
+        text = safe_text(sample_text)
+
+        candidates: list[str] = []
+        if preferred_font:
+            candidates.append(preferred_font)
+
+        if cls._is_japanese_language(target) or cls._contains_japanese(text):
+            candidates.extend(cls._japanese_font_candidates())
+        elif cls._is_chinese_language(target) or cls._contains_chinese(text):
+            candidates.extend(cls._chinese_font_candidates())
+        elif cls._contains_cjk(text):
+            candidates.extend(cls._cjk_font_candidates())
+        else:
+            candidates.extend(cls._latin_font_candidates())
+            candidates.extend(cls._cjk_font_candidates())
+
+        for candidate in cls._unique_candidates(candidates):
+            if not candidate:
+                continue
+            if not cls._font_file_exists(candidate):
+                continue
+            if cls.font_supports_text(candidate, text):
+                if preferred_font and candidate != preferred_font and (cls._contains_cjk(text) or cls._is_cjk_language(target)):
+                    print("[FONT] fallback CJK aplicado")
+                print(f"[FONT] fonte escolhida: {candidate}")
+                return candidate
+            if preferred_font and candidate == preferred_font:
+                print("[FONT] fonte nao suporta texto, procurando outra")
+
+        return None
+
+    @staticmethod
+    def font_supports_text(font_path: str, text: str) -> bool:
+        sample = safe_text(text)
+        if not sample:
+            return True
+        try:
+            font = ImageFont.truetype(font_path, size=24)
+        except OSError:
+            return False
+
+        missing_glyph_masks = set()
+        for missing_char in ("\ufffd", "\u25a1", "\u25a0"):
+            try:
+                missing_mask = font.getmask(missing_char)
+                missing_bbox = missing_mask.getbbox()
+                if missing_bbox is not None:
+                    missing_glyph_masks.add((missing_bbox, bytes(missing_mask)))
+            except Exception:
+                continue
+
+        unsupported = 0
+        checked = 0
+        for char in sample:
+            if char.isspace():
+                continue
+            checked += 1
+            try:
+                mask = font.getmask(char)
+            except Exception:
+                unsupported += 1
+                continue
+            bbox = mask.getbbox()
+            if bbox is None:
+                unsupported += 1
+                continue
+            if (
+                (bbox, bytes(mask)) in missing_glyph_masks
+                and ("\u3000" <= char <= "\u9fff" or "\u3040" <= char <= "\u30ff")
+            ):
+                unsupported += 1
+
+        if checked == 0:
+            return True
+        return unsupported == 0
+
+    @staticmethod
+    def _font_file_exists(candidate: str) -> bool:
+        path = Path(candidate)
+        if path.is_file():
+            return True
+        try:
+            ImageFont.truetype(candidate, size=12)
+            return True
+        except OSError:
+            return False
+
+    @staticmethod
+    def _unique_candidates(candidates: list[str]) -> list[str]:
+        seen: set[str] = set()
+        unique: list[str] = []
+        for candidate in candidates:
+            key = safe_text(candidate).lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            unique.append(candidate)
+        return unique
+
+    @staticmethod
+    def _latin_font_candidates() -> list[str]:
+        return [
+            "arial.ttf",
+            "Arial.ttf",
+            "DejaVuSans.ttf",
+            "DejaVuSans-Bold.ttf",
+            "LiberationSans-Regular.ttf",
+            r"C:\Windows\Fonts\arial.ttf",
+            r"C:\Windows\Fonts\segoeui.ttf",
+        ]
+
+    @classmethod
+    def _japanese_font_candidates(cls) -> list[str]:
+        return [
+            r"C:\Windows\Fonts\YuGothR.ttc",
+            r"C:\Windows\Fonts\YuGothM.ttc",
+            r"C:\Windows\Fonts\msgothic.ttc",
+            r"C:\Windows\Fonts\meiryo.ttc",
+            *cls._cjk_font_candidates(),
+        ]
+
+    @classmethod
+    def _chinese_font_candidates(cls) -> list[str]:
+        return [
+            r"C:\Windows\Fonts\msyh.ttc",
+            r"C:\Windows\Fonts\simhei.ttf",
+            r"C:\Windows\Fonts\simsun.ttc",
+            *cls._cjk_font_candidates(),
+        ]
+
+    @staticmethod
+    def _cjk_font_candidates() -> list[str]:
+        return [
+            "NotoSansCJK-Regular.ttc",
+            "NotoSansCJKjp-Regular.otf",
+            "NotoSansCJKsc-Regular.otf",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.otf",
+            "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJKjp-Regular.otf",
+            "/usr/share/fonts/truetype/noto/NotoSansCJKsc-Regular.otf",
+        ]
+
+    @staticmethod
+    def _is_japanese_language(target_lang: str) -> bool:
+        target = safe_text(target_lang).lower()
+        return target in {"ja", "jp", "jpn", "japan", "japanese", "jpn_jpan"} or target.startswith("ja")
+
+    @staticmethod
+    def _is_chinese_language(target_lang: str) -> bool:
+        target = safe_text(target_lang).lower()
+        return target in {"zh", "zh-cn", "zh_cn", "ch", "china", "chinese", "zho_hans"} or target.startswith("zh")
+
+    @classmethod
+    def _is_cjk_language(cls, target_lang: str) -> bool:
+        return cls._is_japanese_language(target_lang) or cls._is_chinese_language(target_lang)
+
+    @staticmethod
+    def _contains_japanese(text: str) -> bool:
+        return any("\u3040" <= char <= "\u30ff" or "\u31f0" <= char <= "\u31ff" for char in safe_text(text))
+
+    @staticmethod
+    def _contains_chinese(text: str) -> bool:
+        return any("\u4e00" <= char <= "\u9fff" or "\u3400" <= char <= "\u4dbf" for char in safe_text(text))
+
+    @classmethod
+    def _contains_cjk(cls, text: str) -> bool:
+        return cls._contains_japanese(text) or cls._contains_chinese(text)
 
     def _spacing_candidates(self) -> tuple[float, ...]:
         base = float(getattr(self.config, "line_spacing_ratio", 1.12))
@@ -673,14 +870,15 @@ class TextRenderer:
 
         while remaining and self._text_width(draw, remaining, font) > max_width:
             split_at = len(remaining)
+            suffix = "" if self._contains_cjk(remaining) else "-"
 
-            while split_at > 1 and self._text_width(draw, remaining[:split_at] + "-", font) > max_width:
+            while split_at > 1 and self._text_width(draw, remaining[:split_at] + suffix, font) > max_width:
                 split_at -= 1
 
             if split_at <= 1:
                 return lines, remaining
 
-            lines.append(remaining[:split_at] + "-")
+            lines.append(remaining[:split_at] + suffix)
             remaining = remaining[split_at:]
 
         return lines, remaining
@@ -692,6 +890,11 @@ class TextRenderer:
         font,
         max_width: int,
     ) -> list[str]:
+        """
+        Tenta evitar primeira linha muito comprida e última linha muito curta.
+        Isso melhora o visual centralizado dentro do balão.
+        """
+
         if len(lines) < 2:
             return lines
 

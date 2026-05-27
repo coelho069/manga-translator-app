@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-import zipfile
+import gc
+import os
+import threading
+import time
+import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from time import perf_counter
 
@@ -9,41 +14,170 @@ from app.pipeline import MangaTranslatorPipeline
 from app.types import AppResult
 from app.utils import (
     ensure_dir,
-    get_translation_mode_config,
+    get_translation_flow_config,
     make_job_dir,
     resolve_ocr_lang,
     resolve_translation_lang,
-    resolve_translation_mode,
+    resolve_translation_flow,
     safe_text,
     sanitize_filename,
 )
 
 
+_PIPELINE_LOCK = threading.Lock()
+_STATE_LOCK = threading.Lock()
+_active_job: dict = {"job_id": None, "started_at": None, "status": None}
+_LOCK_TTL_SECONDS = int(os.getenv("PROCESSING_LOCK_TTL_SECONDS", "900") or "900")
+
+
+def _force_release_if_expired() -> bool:
+    with _STATE_LOCK:
+        started = _active_job["started_at"]
+        if started is None:
+            return False
+        age = time.time() - started
+        if age < _LOCK_TTL_SECONDS:
+            return False
+        print(f"[LOCK] expired active_job={_active_job['job_id']} age_seconds={age:.1f}")
+        _active_job["job_id"] = None
+        _active_job["started_at"] = None
+        _active_job["status"] = None
+    if _PIPELINE_LOCK.locked():
+        try:
+            _PIPELINE_LOCK.release()
+        except RuntimeError:
+            pass
+    return True
+
+
+@contextmanager
+def _single_page_processing(timeout_seconds: int = 30):
+    job_id = uuid.uuid4().hex[:12]
+    start = perf_counter()
+    acquired = _PIPELINE_LOCK.acquire(timeout=max(1, int(timeout_seconds)))
+    if not acquired and _force_release_if_expired():
+        acquired = _PIPELINE_LOCK.acquire(blocking=False)
+    wait_elapsed = perf_counter() - start
+    if not acquired:
+        with _STATE_LOCK:
+            busy_id = _active_job["job_id"]
+            busy_status = _active_job["status"]
+            busy_started = _active_job["started_at"]
+        busy_age = (time.time() - busy_started) if busy_started else 0.0
+        print(f"[LOCK] busy active_job={busy_id} status={busy_status} age_seconds={busy_age:.1f}")
+        raise RuntimeError("Outro processamento ainda esta em andamento. Tente novamente em instantes.")
+    with _STATE_LOCK:
+        _active_job["job_id"] = job_id
+        _active_job["started_at"] = time.time()
+        _active_job["status"] = "processing"
+    print(f"[LOCK] acquire job_id={job_id}")
+    print(f"[JOB] status job_id={job_id} status=processing")
+    print(f"[FLOW] pipeline_lock_acquired wait={wait_elapsed:.2f}s")
+    reason = "done"
+    try:
+        yield job_id
+    except Exception as exc:
+        reason = "failed"
+        print(f"[JOB_ERROR] job_id={job_id} stage=pipeline error={exc}")
+        raise
+    finally:
+        with _STATE_LOCK:
+            _active_job["status"] = reason
+            _active_job["job_id"] = None
+            _active_job["started_at"] = None
+        try:
+            _PIPELINE_LOCK.release()
+        except RuntimeError:
+            pass
+        print(f"[JOB] status job_id={job_id} status={reason}")
+        print(f"[LOCK] release job_id={job_id} reason={reason}")
+        print("[FLOW] pipeline_lock_released")
+
+
+def reset_processing(reason: str = "cancelled") -> dict:
+    with _STATE_LOCK:
+        prev_id = _active_job["job_id"]
+        prev_status = _active_job["status"]
+        started = _active_job["started_at"]
+        age = (time.time() - started) if started else 0.0
+        _active_job["job_id"] = None
+        _active_job["started_at"] = None
+        _active_job["status"] = reason
+    if _PIPELINE_LOCK.locked():
+        try:
+            _PIPELINE_LOCK.release()
+        except RuntimeError:
+            pass
+    print(f"[LOCK] release job_id={prev_id} reason={reason}")
+    print(f"[JOB] status job_id={prev_id} status={reason}")
+    return {
+        "released": True,
+        "previous_job": prev_id,
+        "previous_status": prev_status,
+        "age_seconds": age,
+        "reason": reason,
+    }
+
+
+def get_processing_status() -> dict:
+    with _STATE_LOCK:
+        started = _active_job["started_at"]
+        return {
+            "active_job": _active_job["job_id"],
+            "status": _active_job["status"],
+            "age_seconds": (time.time() - started) if started else 0.0,
+            "ttl_seconds": _LOCK_TTL_SECONDS,
+            "locked": _PIPELINE_LOCK.locked(),
+        }
+
+
+_DEFAULT_FLOW = os.getenv("DEFAULT_TRANSLATION_FLOW", "auto_to_en")
+_DEFAULT_PROVIDER = os.getenv("TRANSLATION_PROVIDER", "multilingual")
+_DEFAULT_MODEL = os.getenv("TRANSLATION_MODEL") or os.getenv("HF_TRANSLATION_MODEL") or "facebook/m2m100_418M"
+
+
 def process_uploaded_image(
     filename,
     content,
-    translation_mode="en_to_pt",
+    translation_flow=None,
     source_lang=None,
     target_lang=None,
     ocr_lang=None,
+    ocr_engine="auto",
     translation_style="natural",
     performance_mode="balanced",
+    translation_provider=None,
+    hf_translation_model=None,
     debug_enabled=False,
     progress_callback=None,
-    min_font_size=None,
-    max_font_size=None,
-    line_spacing_ratio=None,
-    auto_font_resize=None,
-    center_text=None,
-    bold_text=None,
-    text_color=None,
 ) -> AppResult:
-    mode_key = resolve_translation_mode(translation_mode)
-    mode_config = get_translation_mode_config(mode_key)
+    print(f"[FLOW] upload_received filename={safe_text(filename) or 'upload'} bytes={len(content or b'')}")
+    # If the caller passed raw source/target codes but no flow, derive the
+    # flow from the pair so OCR lang isn't silently inherited from the default
+    # auto→en flow (which would pin OCR to Japanese).
+    explicit_pair = bool(safe_text(source_lang)) and bool(safe_text(target_lang)) and not safe_text(translation_flow)
+    if explicit_pair:
+        candidate_flow = f"{resolve_translation_lang(source_lang)}_to_{resolve_translation_lang(target_lang)}"
+        mode_key = resolve_translation_flow(candidate_flow)
+    else:
+        mode_key = resolve_translation_flow(translation_flow or _DEFAULT_FLOW)
+    mode_config = get_translation_flow_config(mode_key)
     resolved_source_lang = resolve_translation_lang(source_lang or mode_config["source_lang"])
     resolved_target_lang = resolve_translation_lang(target_lang or mode_config["target_lang"])
-    resolved_ocr_lang = safe_text(ocr_lang) or mode_config["ocr_lang"] or resolve_ocr_lang(resolved_source_lang)
+    # When the caller forces a source different from the flow's, the flow's
+    # OCR lang may not apply — fall back to source-derived OCR lang.
+    if safe_text(source_lang) and resolved_source_lang != mode_config["source_lang"]:
+        resolved_ocr_lang = safe_text(ocr_lang) or resolve_ocr_lang(resolved_source_lang)
+    else:
+        resolved_ocr_lang = safe_text(ocr_lang) or mode_config["ocr_lang"] or resolve_ocr_lang(resolved_source_lang)
     resolved_ocr_lang = resolve_ocr_lang(resolved_ocr_lang)
+    print(
+        f"[FLOW] lang_resolved source={resolved_source_lang} target={resolved_target_lang} "
+        f"ocr={resolved_ocr_lang} flow={mode_key}"
+    )
+    resolved_ocr_engine = safe_text(ocr_engine).lower() or "auto"
+    if resolved_ocr_engine not in {"auto", "paddle", "manga"}:
+        resolved_ocr_engine = "auto"
 
     style = safe_text(translation_style).lower()
     if style not in {"natural", "literal"}:
@@ -51,54 +185,78 @@ def process_uploaded_image(
     perf_mode = safe_text(performance_mode).lower()
     if perf_mode not in {"quality", "balanced", "fast"}:
         perf_mode = "balanced"
+    provider = safe_text(translation_provider) or _DEFAULT_PROVIDER
+    model = safe_text(hf_translation_model) or _DEFAULT_MODEL
     config = _build_config(
-        translation_mode=resolve_translation_mode(translation_mode),
+        translation_flow=mode_key,
         source_lang=resolved_source_lang,
         target_lang=resolved_target_lang,
         ocr_lang=resolved_ocr_lang,
+        ocr_engine=resolved_ocr_engine,
         translation_style=style,
         performance_mode=perf_mode,
+        translation_provider=provider,
+        hf_translation_model=model,
         debug_enabled=bool(debug_enabled),
-        min_font_size=min_font_size,
-        max_font_size=max_font_size,
-        line_spacing_ratio=line_spacing_ratio,
-        auto_font_resize=auto_font_resize,
-        center_text=center_text,
-        bold_text=bold_text,
-        text_color=text_color,
     )
     ensure_dir(config.output_dir)
     job_dir = make_job_dir(config.output_dir)
 
     safe_name = sanitize_filename(filename)
     input_path = Path(job_dir) / safe_name
-    input_path.write_bytes(content)
+    try:
+        input_path.write_bytes(content)
 
-    pipeline = MangaTranslatorPipeline(config=config)
-    return pipeline.run(input_path, output_dir=job_dir, progress_callback=progress_callback)
+        print(f"[FLOW] processing_start job_dir={job_dir}")
+        print(f"[FLOW] page_start file={safe_name}")
+        with _single_page_processing(int(os.getenv("PIPELINE_LOCK_TIMEOUT_SECONDS", "30") or "30")):
+            pipeline = MangaTranslatorPipeline(config=config)
+            try:
+                result = pipeline.run(input_path, output_dir=job_dir, progress_callback=progress_callback)
+            finally:
+                # Drop the per-job pipeline (renderer/cleaner state) so its
+                # numpy buffers can be collected before the next page.
+                pipeline = None
+                _release_inference_memory()
+        print(f"[FLOW] page_done file={safe_name}")
+        print(f"[FLOW] processing_done job_dir={job_dir}")
+        return result
+    except Exception as exc:
+        print(f"[FLOW_ERROR] processing {exc}")
+        raise
+
+
+def _release_inference_memory() -> None:
+    gc.collect()
+    try:
+        import torch
+
+        if hasattr(torch, "cuda") and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 
 def _build_config(
-    translation_mode: str,
+    translation_flow: str,
     source_lang: str,
     target_lang: str,
     ocr_lang: str,
+    ocr_engine: str,
     translation_style: str,
     performance_mode: str,
+    translation_provider: str,
+    hf_translation_model: str,
     debug_enabled: bool,
-    min_font_size: int | None = None,
-    max_font_size: int | None = None,
-    line_spacing_ratio: float | None = None,
-    auto_font_resize: bool | None = None,
-    center_text: bool | None = None,
-    bold_text: bool | None = None,
-    text_color: tuple[int, int, int] | None = None,
 ) -> AppConfig:
     base = {
-        "translation_mode": resolve_translation_mode(translation_mode),
-        "source_lang": source_lang,
-        "target_lang": target_lang,
-        "ocr_lang": ocr_lang,
+        "translation_flow": resolve_translation_flow(translation_flow),
+        "translation_provider": safe_text(translation_provider) or _DEFAULT_PROVIDER,
+        "hf_translation_model": safe_text(hf_translation_model) or _DEFAULT_MODEL,
+        "source_lang": safe_text(source_lang) or "auto",
+        "target_lang": safe_text(target_lang) or "en",
+        "ocr_lang": safe_text(ocr_lang) or "japan",
+        "ocr_engine": ocr_engine,
         "translation_style": translation_style,
         "performance_mode": performance_mode,
         "debug_enabled": debug_enabled,
@@ -106,8 +264,9 @@ def _build_config(
     if performance_mode == "fast":
         base.update(
             {
-                "yolo_imgsz": 640,
-                "yolo_confidence": 0.24,
+                "yolo_imgsz": 512,
+                "yolo_confidence": 0.26,
+                "yolo_max_det": 25,
                 "min_ocr_area": 1600,
                 "min_ocr_width": 32,
                 "min_ocr_height": 24,
@@ -127,8 +286,9 @@ def _build_config(
     elif performance_mode == "quality":
         base.update(
             {
-                "yolo_imgsz": 1280,
+                "yolo_imgsz": 960,
                 "yolo_confidence": 0.18,
+                "yolo_max_det": 60,
                 "min_ocr_area": 500,
                 "min_ocr_width": 18,
                 "min_ocr_height": 14,
@@ -140,158 +300,7 @@ def _build_config(
                 "cleanup_extra_dilate_px": 3,
                 "render_margin_px": 14,
                 "max_font_size": 32,
-                "max_render_font_attempts": 40,
+                "max_render_font_attempts": 28,
             }
         )
-    if min_font_size is not None:
-        base["min_font_size"] = int(min_font_size)
-    if max_font_size is not None:
-        base["max_font_size"] = int(max_font_size)
-    if line_spacing_ratio is not None:
-        base["line_spacing_ratio"] = float(line_spacing_ratio)
-    if auto_font_resize is not None:
-        base["auto_font_resize"] = bool(auto_font_resize)
-    if center_text is not None:
-        base["center_text"] = bool(center_text)
-    if bold_text is not None:
-        base["bold_text"] = bool(bold_text)
-    if text_color is not None:
-        base["text_color"] = tuple(text_color)
-
     return AppConfig(**base)
-
-
-def process_batch(
-    files: list[tuple[str, bytes]],
-    translation_mode="en_to_pt",
-    source_lang=None,
-    target_lang=None,
-    ocr_lang=None,
-    translation_style="natural",
-    performance_mode="balanced",
-    debug_enabled=False,
-    progress_callback=None,
-    min_font_size=None,
-    max_font_size=None,
-    line_spacing_ratio=None,
-    auto_font_resize=None,
-    center_text=None,
-    bold_text=None,
-    text_color=None,
-) -> list[AppResult]:
-    mode_key = resolve_translation_mode(translation_mode)
-    mode_config = get_translation_mode_config(mode_key)
-    resolved_source_lang = resolve_translation_lang(source_lang or mode_config["source_lang"])
-    resolved_target_lang = resolve_translation_lang(target_lang or mode_config["target_lang"])
-    resolved_ocr_lang = safe_text(ocr_lang) or mode_config["ocr_lang"] or resolve_ocr_lang(resolved_source_lang)
-    resolved_ocr_lang = resolve_ocr_lang(resolved_ocr_lang)
-
-    style = safe_text(translation_style).lower()
-    if style not in {"natural", "literal"}:
-        style = "natural"
-    perf_mode = safe_text(performance_mode).lower()
-    if perf_mode not in {"quality", "balanced", "fast"}:
-        perf_mode = "balanced"
-
-    config = _build_config(
-        translation_mode=resolve_translation_mode(translation_mode),
-        source_lang=resolved_source_lang,
-        target_lang=resolved_target_lang,
-        ocr_lang=resolved_ocr_lang,
-        translation_style=style,
-        performance_mode=perf_mode,
-        debug_enabled=bool(debug_enabled),
-        min_font_size=min_font_size,
-        max_font_size=max_font_size,
-        line_spacing_ratio=line_spacing_ratio,
-        auto_font_resize=auto_font_resize,
-        center_text=center_text,
-        bold_text=bold_text,
-        text_color=text_color,
-    )
-    ensure_dir(config.output_dir)
-
-    pipeline = MangaTranslatorPipeline(config=config)
-
-    results: list[AppResult] = []
-    total_files = len(files)
-    batch_start = perf_counter()
-    page_times: list[float] = []
-
-    print(f"\n{'='*60}")
-    print(f"[BATCH] Iniciando lote de {total_files} paginas")
-    print(f"[BATCH] Modo: {perf_mode} | Traducao: {style}")
-    print(f"{'='*60}\n")
-
-    for idx, (filename, content) in enumerate(files):
-        page_start = perf_counter()
-
-        def page_progress(value: float, message: str, meta=None) -> None:
-            if progress_callback is not None:
-                overall = (idx + value) / total_files
-                try:
-                    progress_callback(overall, f"Pagina {idx + 1}/{total_files}: {message}", meta)
-                except TypeError:
-                    progress_callback(overall, f"Pagina {idx + 1}/{total_files}: {message}")
-
-        job_dir = make_job_dir(config.output_dir)
-        safe_name = sanitize_filename(filename)
-        input_path = Path(job_dir) / safe_name
-        input_path.write_bytes(content)
-
-        try:
-            result = pipeline.run(input_path, output_dir=job_dir, progress_callback=page_progress)
-            results.append(result)
-        except Exception as exc:
-            print(f"[BATCH] ERRO na pagina {idx + 1} ({filename}): {exc}")
-            continue
-
-        page_elapsed = round(perf_counter() - page_start, 2)
-        page_times.append(page_elapsed)
-
-        bubbles = result.bubbles
-        timings = result.metadata.get("timings", {})
-        detected = result.metadata.get("detected_count", 0)
-        rendered = result.metadata.get("rendered_count", 0)
-
-        print(f"[BATCH] Pagina {idx + 1}/{total_files} concluida em {page_elapsed}s")
-        print(f"  Baloes: {detected} | Renderizados: {rendered} | "
-              f"Detect: {timings.get('detect', 0):.2f}s | OCR: {timings.get('ocr', 0):.2f}s | "
-              f"Traducao: {timings.get('translate', 0):.2f}s | Limpeza: {timings.get('clean', 0):.2f}s | "
-              f"Render: {timings.get('render', 0):.2f}s")
-
-    batch_elapsed = round(perf_counter() - batch_start, 2)
-    avg_time = round(sum(page_times) / max(1, len(page_times)), 2)
-
-    print(f"\n{'='*60}")
-    print(f"[BATCH] Lote concluido")
-    print(f"  Paginas processadas: {len(results)}/{total_files}")
-    print(f"  Tempo total: {batch_elapsed}s")
-    print(f"  Tempo medio por pagina: {avg_time}s")
-    if page_times:
-        slowest = max(page_times)
-        fastest = min(page_times)
-        print(f"  Pagina mais rapida: {fastest}s")
-        print(f"  Pagina mais lenta: {slowest}s")
-    print(f"{'='*60}\n")
-
-    if progress_callback is not None:
-        try:
-            progress_callback(1.0, "Lote concluido")
-        except TypeError:
-            progress_callback(1.0, "Lote concluido")
-
-    return results
-
-
-def create_batch_zip(results: list[AppResult]) -> bytes:
-    import io
-
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for idx, result in enumerate(results):
-            translated_path = Path(result.translated_image_path)
-            if translated_path.exists():
-                arcname = translated_path.name
-                zf.write(translated_path, arcname)
-    return buf.getvalue()

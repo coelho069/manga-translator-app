@@ -1,285 +1,358 @@
 # Manga Translator App
 
-Aplicativo Python com interface Streamlit para traduzir páginas de mangá a partir de imagens ou PDFs.
+Aplicativo local em Python com Streamlit para traduzir páginas de mangá de japonês para inglês.  
+O app recebe uma imagem, detecta balões de fala com YOLO segmentation, lê o texto japonês com OCR, traduz por API configurável, tenta apagar o texto original e renderiza a tradução em inglês dentro dos balões.
 
-O sistema recebe uma página, detecta balões de fala, executa OCR no recorte de cada balão, traduz o texto, apaga o texto original dentro da máscara do balão e renderiza a tradução na imagem final.
+O processamento roda localmente no Windows e usa CPU por padrão.
 
-Fluxo principal:
+## Funcionalidades
+
+- Upload de imagens PNG, JPG e JPEG.
+- Pré-visualização da imagem original.
+- Detecção de balões de fala com YOLO segmentation.
+- OCR japonês.
+- Tradução automática local para inglês com `Helsinki-NLP/opus-mt-ja-en`.
+- Limpeza do texto original dentro dos balões.
+- Renderização da tradução centralizada no balão.
+- Comparação lado a lado entre imagem original e traduzida.
+- Botão para baixar a imagem traduzida.
+- Execução local no navegador com Streamlit.
+- Geração de imagens de exemplo para testes.
+
+## Idiomas Suportados
+
+O app aceita dois idiomas de entrada nesta versão:
+
+| Entrada | OCR | Tradução por API | Saída |
+| --- | --- | --- | --- |
+| Japonês | `japan` | `ja -> en` | Inglês |
+
+Na interface Streamlit, selecione **Idioma de entrada** antes de iniciar a tradução. Se um valor inválido for recebido internamente, o app usa inglês como fallback.
+
+## Qualidade da Tradução
+
+O app possui dois estilos de tradução:
+
+- **Natural**: prioriza inglês natural em estilo curto de balão de mangá.
+- **Literal**: usa uma tradução mais direta, com menos ajustes idiomáticos.
+
+No modo **Natural**, o tradutor aplica algumas melhorias antes e depois da tradução:
+
+- tradução em lote por página, mantendo a ordem dos balões;
+- cache para frases repetidas, ajudando na consistência;
+- glossário simples para preservar honoríficos como `senpai`, `sensei`, `kun`, `chan` e `san`;
+- proteção básica de possíveis nomes próprios antes de enviar o texto ao tradutor;
+- normalização de pontuação em inglês, preservando `!`, `?`, `...` e combinações emocionais.
+
+Exemplos de expressões tratadas com mais naturalidade:
 
 ```text
-upload -> detecção de balões -> OCR -> tradução -> limpeza do texto original -> renderização -> resultado final
+No way! -> Não pode ser!
+I got it! -> Entendi!
+Shut up! -> Cala a boca!
+Damn it! -> Droga!
 ```
 
-## O Que O Projeto Faz
+A tradução continua sendo automática e pode falhar em frases ambíguas, piadas, nomes incomuns ou contexto visual que não esteja no texto OCR.
 
-- Recebe imagens `PNG`, `JPG`, `JPEG` ou arquivos `PDF`.
-- Converte páginas de PDF em imagens com PyMuPDF.
-- Detecta e segmenta balões de fala com YOLOv8 segmentation.
-- Faz OCR do texto dentro dos balões pelo módulo `app/ocr.py`.
-- Traduz o texto com CTranslate2 usando modelo SMALL100 baixado do Hugging Face.
-- Remove o texto original dentro da máscara de cada balão.
-- Renderiza a tradução dentro da área segura do balão.
-- Mostra o resultado na interface Streamlit e permite baixar as páginas traduzidas.
-- Salva os resultados em `output/`.
+## Performance
 
-Observação: o código atual usa `PaddleOCR` para OCR. Não há dependência `manga-ocr` no `requirements.txt`.
+O app possui três modos de performance:
 
-## Tecnologias Usadas
+- **Equilibrado**: padrão recomendado, mantém boa qualidade com custo moderado.
+- **Rápido**: pula balões pequenos com mais agressividade, reduz morfologia e limita tentativas de renderização.
+- **Qualidade**: preserva ajustes mais cuidadosos e tende a processar mais balões, com maior custo.
 
-- Python 3.10.
-- Streamlit para a interface web.
-- Ultralytics YOLOv8 segmentation para detectar balões.
-- Modelo de balões `kitsumed/yolov8m_seg-speech-bubble` via Hugging Face.
-- PaddleOCR/PaddlePaddle para OCR.
-- CTranslate2 e SentencePiece para tradução.
-- Modelo `entai2965/small100-ctranslate2` para tradução.
-- Pillow e OpenCV para manipulação, limpeza e renderização de imagem.
-- PyMuPDF para converter PDFs em páginas PNG.
+O pipeline registra tempos por etapa em `result.metadata["timings"]`, incluindo:
 
-Não há API FastAPI nem serviço systemd versionado neste repositório.
+```text
+load_image
+detect
+ocr
+translate
+clean
+render
+save
+total
+```
 
-## Estrutura Do Projeto
+Na interface, o resultado mostra o tempo total e permite abrir os tempos por etapa. O debug visual fica desligado por padrão para evitar escrita desnecessária de imagens em disco; habilite **Salvar debug visual** apenas quando estiver investigando problemas.
+
+## Demonstração / Fluxo
+
+1. Instale as dependências do projeto.
+2. Coloque o modelo YOLO em `models/bubble_seg.pt`.
+3. Rode o aplicativo Streamlit.
+4. Escolha o idioma de entrada: inglês ou chinês.
+5. Envie uma página de mangá no idioma escolhido.
+6. Clique em **Iniciar tradução**.
+7. Aguarde as etapas de detecção, OCR, tradução, limpeza e renderização.
+8. Baixe a imagem traduzida ou acesse o resultado em `output/`.
+
+## Estrutura do Projeto
 
 ```text
 manga-translator-app/
   app/
-    backend.py        # Entrada usada pela UI; cria jobs e chama o pipeline
-    cleaner.py        # Limpeza/inpainting/fill do texto original nos balões
-    config.py         # Configurações padrão do pipeline
-    detector.py       # Carregamento do YOLO e segmentação dos balões
-    ocr.py            # OCR dos crops de balão
-    pdf_utils.py      # Conversão de PDF para imagens
-    pipeline.py       # Orquestra detecção, OCR, tradução, limpeza e renderização
-    renderer.py       # Desenha a tradução dentro do balão
-    translator.py     # Tradução com CTranslate2/SMALL100
-    types.py          # Tipos compartilhados do pipeline
-    utils.py          # Utilidades gerais e modos de tradução
-  examples/           # Imagens/scripts de exemplo
-  models/             # Modelo YOLO local, quando baixado ou copiado
-  output/             # Jobs, imagens traduzidas e arquivos de debug
-  streamlit_app.py    # Interface principal Streamlit
-  requirements.txt    # Dependências Python
-  packages.txt        # Pacotes de sistema úteis em Linux/VPS
-  setup.ps1           # Instalação local no Windows
-  run_app.ps1         # Execução local no Windows
+    config.py
+    types.py
+    utils.py
+    detector.py
+    ocr.py
+    translator.py
+    cleaner.py
+    renderer.py
+    pipeline.py
+    backend.py
+  examples/
+    bubbles/
+    create_bubble_examples.py
+  models/
+    bubble_seg.pt
+  output/
+  streamlit_app.py
+  requirements.txt
+  setup.ps1
+  run_app.ps1
 ```
 
-## Modos De Tradução
+### Arquivos principais
 
-Os modos disponíveis ficam em `app/utils.py`:
+- `app/detector.py`: carrega o modelo YOLO segmentation e detecta os balões de fala.
+- `app/ocr.py`: executa OCR no idioma selecionado com PaddleOCR e retorna textos/polígonos detectados.
+- `app/translator.py`: traduz japonês -> inglês com `Helsinki-NLP/opus-mt-ja-en` carregado uma vez e reutilizado.
+- `app/cleaner.py`: tenta remover o texto original dentro dos balões, preservando a borda.
+- `app/renderer.py`: quebra linhas, ajusta fonte e desenha a tradução dentro do balão.
+- `app/pipeline.py`: coordena o fluxo completo de detecção, OCR, tradução, limpeza e renderização.
+- `app/backend.py`: recebe a imagem enviada, cria diretório de saída e chama o pipeline.
+- `streamlit_app.py`: interface web local do aplicativo.
 
-```text
-en_to_pt  -> Inglês para Português
-ja_to_en  -> Japonês para Inglês
-```
+## Requisitos
 
-O destino padrão do `AppConfig` é configurável no código. A interface usa os modos definidos em `TRANSLATION_MODES`.
+- Windows.
+- Python 3.10.
+- PowerShell.
+- Ambiente virtual recomendado.
+- Processamento padrão em CPU.
 
-## Modelo De Detecção De Balões
+> Observação: algumas dependências, especialmente `torch`, `paddlepaddle`, `paddleocr` e `ultralytics`, podem ser pesadas. A instalação inicial pode demorar.
 
-O detector espera o modelo em:
+## Instalação
 
-```text
-models/bubble_seg.pt
-```
+### A) Instalação rápida com script
 
-Se o arquivo não existir e `auto_download_bubble_model=True`, o código baixa automaticamente:
-
-```text
-repo: kitsumed/yolov8m_seg-speech-bubble
-arquivo: model.pt
-destino local: models/bubble_seg.pt
-```
-
-O YOLO é usado para obter, por balão:
-
-- `bbox`;
-- máscara segmentada;
-- confiança;
-- crop seguro para OCR;
-- área segura para limpeza e renderização.
-
-## Instalação Local
-
-### Windows
-
-Na raiz do projeto:
+Na pasta raiz do projeto, execute:
 
 ```powershell
 .\setup.ps1
 ```
 
-Ou manualmente:
+O script cria o ambiente virtual `.venv`, instala o PyTorch CPU, instala as dependências do `requirements.txt` e cria as pastas necessárias.
+
+### B) Instalação manual
+
+Na pasta raiz do projeto:
 
 ```powershell
 py -3.10 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip setuptools wheel
+python -m pip install torch==2.2.2 torchvision==0.17.2 --index-url https://download.pytorch.org/whl/cpu
 python -m pip install -r requirements.txt
 ```
 
-Para rodar:
+## Modelo YOLO
+
+O aplicativo precisa de um modelo YOLO segmentation neste caminho:
+
+```text
+models/bubble_seg.pt
+```
+
+Por padrão, se esse arquivo não existir, o detector baixa automaticamente o modelo do Hugging Face:
+
+```text
+kitsumed/yolov8m_seg-speech-bubble
+```
+
+O arquivo baixado do repositório é `model.pt`, salvo localmente como:
+
+```text
+models/bubble_seg.pt
+```
+
+Esse arquivo não vai para o Git por padrão, pois modelos `.pt` costumam ser grandes e podem variar conforme o treino.
+
+O modelo esperado deve detectar a classe:
+
+```text
+speech bubble
+```
+
+Para verificar as classes do modelo:
+
+```powershell
+python -c "from ultralytics import YOLO; m=YOLO('models/bubble_seg.pt'); print(m.names)"
+```
+
+O resultado esperado deve conter algo como:
+
+```python
+{0: 'speech bubble'}
+```
+
+Durante a detecção, o app também salva arquivos de debug rápidos em `output/`:
+
+```text
+output/debug_detection.png
+output/debug_masks.png
+output/debug_boxes.json
+```
+
+## Como Executar
+
+Com o ambiente configurado:
 
 ```powershell
 .\run_app.ps1
 ```
 
-Ou:
+Ou manualmente:
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
 python -m streamlit run streamlit_app.py
 ```
 
-### Linux/VPS
-
-Instale os pacotes de sistema listados em `packages.txt` ou equivalentes da distribuição:
-
-```bash
-sudo apt update
-sudo apt install -y python3.10 python3.10-venv python3-pip
-xargs -a packages.txt sudo apt install -y
-```
-
-Crie o ambiente e instale as dependências:
-
-```bash
-cd /caminho/para/manga-translator-app
-python3.10 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install -r requirements.txt
-```
-
-Rode a aplicação:
-
-```bash
-source .venv/bin/activate
-python -m streamlit run streamlit_app.py --server.address 0.0.0.0 --server.port 8501
-```
-
-Acesse no navegador:
+O Streamlit abrirá o app no navegador local, normalmente em:
 
 ```text
-http://SEU_SERVIDOR:8501
+http://localhost:8501
 ```
 
 ## Como Usar
 
-1. Abra a interface Streamlit.
-2. Escolha o modo de tradução.
-3. Ajuste performance e fonte na barra lateral, se necessário.
-4. Envie uma ou mais imagens, ou um PDF.
-5. Aguarde o processamento página por página.
-6. Baixe cada página traduzida ou o `.zip` final.
+1. Abra o app no navegador.
+2. Escolha o idioma de entrada: **Inglês** ou **Chinês**.
+3. Escolha o estilo de tradução: **Natural** ou **Literal**.
+4. Escolha o modo de performance: **Equilibrado**, **Rápido** ou **Qualidade**.
+5. Envie uma imagem PNG, JPG ou JPEG.
+6. Opcionalmente, marque **Usar imagem de exemplo** para testar com arquivos de `examples/bubbles/`.
+7. Clique em **Iniciar tradução**.
+8. Acompanhe a barra de progresso.
+9. Compare a imagem original e a imagem traduzida lado a lado.
+10. Baixe a imagem traduzida pelo botão da interface.
+11. Também é possível encontrar os resultados em `output/`.
 
-Os arquivos gerados ficam em subpastas de:
+## Linha de Comando / Testes
 
-```text
-output/
+Gerar exemplos variados de balões:
+
+```powershell
+python examples\create_bubble_examples.py
 ```
 
-## Como Rodar Na VPS
+Verificar sintaxe dos principais arquivos Python:
 
-Execução direta:
-
-```bash
-cd /caminho/para/manga-translator-app
-source .venv/bin/activate
-python -m streamlit run streamlit_app.py --server.address 0.0.0.0 --server.port 8501
+```powershell
+python -m compileall app streamlit_app.py examples
 ```
 
-Para manter rodando em uma sessão simples:
+Rodar o app:
 
-```bash
-cd /caminho/para/manga-translator-app
-source .venv/bin/activate
-nohup python -m streamlit run streamlit_app.py --server.address 0.0.0.0 --server.port 8501 > output/streamlit.log 2>&1 &
-```
-
-Ver logs nesse modo:
-
-```bash
-tail -f output/streamlit.log
-```
-
-Este repositório não contém arquivo `.service` do systemd. Se a VPS tiver um serviço criado manualmente, os comandos normalmente serão:
-
-```bash
-sudo systemctl status manga-translator
-sudo journalctl -u manga-translator -f
-sudo systemctl restart manga-translator
-```
-
-O nome do serviço depende da configuração feita no servidor.
-
-## Variáveis De Ambiente
-
-Não há arquivo `.env` nem leitura direta de variáveis de ambiente no código atual.
-
-As principais configurações ficam em `app/config.py` e em controles da interface Streamlit:
-
-```text
-translation_model
-translation_cache_enabled
-translation_timeout_seconds
-translation_beam_size
-source_lang
-target_lang
-ocr_lang
-yolo_confidence
-yolo_iou
-yolo_imgsz
-use_gpu
-debug_enabled
-```
-
-Se o projeto for adaptado para `.env` em deploy, não salve credenciais no Git.
-
-## Debug E Saídas
-
-Quando o debug está ativado, o pipeline pode salvar imagens intermediárias e relatórios em `output/`, incluindo máscaras, caixas detectadas e imagens antes/depois da limpeza.
-
-Arquivos comuns:
-
-```text
-output/debug_detection.png
-output/debug_masks.png
-output/debug_boxes.json
-output/job_.../translated_*.png
-```
-
-## Validação Rápida
-
-Verificar sintaxe dos módulos:
-
-```bash
-python -m compileall app streamlit_app.py
-```
-
-Verificar se as dependências principais importam:
-
-```bash
-python - <<'PY'
-import cv2
-import numpy
-import PIL
-import streamlit
-import ultralytics
-import huggingface_hub
-print("Dependências principais OK")
-PY
-```
-
-Rodar a aplicação localmente:
-
-```bash
+```powershell
 python -m streamlit run streamlit_app.py
 ```
 
-## Observações
+## Modelo Personalizado
 
-- A primeira execução pode demorar porque modelos do Hugging Face e PaddleOCR podem ser baixados para cache local.
-- O processamento padrão usa CPU.
-- Modelos e outputs podem ocupar bastante espaço em disco.
-- A qualidade final depende da segmentação dos balões, do OCR e do modelo de tradução.
+Para melhorar a detecção dos balões, use ou treine um modelo YOLO segmentation compatível em um fluxo separado e depois substitua o peso usado pelo aplicativo:
+
+```text
+models/bubble_seg.pt
+```
+
+Este repositório mantém apenas a estrutura necessária para executar o app local. Datasets, scripts de treino e resultados de treino não fazem parte do fluxo principal e devem ficar fora do repositório runtime.
+
+## Problemas Comuns
+
+### Modelo não encontrado
+
+Verifique se o arquivo existe exatamente em:
+
+```text
+models/bubble_seg.pt
+```
+
+Sem esse arquivo, o detector YOLO não consegue iniciar.
+
+### Erro do Torch `shm.dll` no Windows
+
+Esse erro costuma estar relacionado à instalação do PyTorch ou a conflitos no ambiente Python. Tente recriar a `.venv` e instalar o PyTorch CPU pelo índice oficial:
+
+```powershell
+python -m pip install torch==2.2.2 torchvision==0.17.2 --index-url https://download.pytorch.org/whl/cpu
+```
+
+### `paddlepaddle` não compatível com Python 3.14
+
+Use Python 3.10. O projeto foi pensado para Python 3.10 no Windows. Versões muito novas do Python podem não ter wheels compatíveis para `paddlepaddle`.
+
+### App escrevendo a tradução por cima do texto original
+
+Isso indica que a etapa de limpeza não conseguiu gerar uma máscara boa para remover o texto antigo. Verifique os arquivos de debug em `output/<job>/debug/`, especialmente:
+
+```text
+debug_dark_text_mask.png
+debug_ocr_mask.png
+debug_final_cleanup_mask.png
+debug_after_cleanup.png
+```
+
+Se a máscara final não cobre o texto antigo, ajuste as configurações de limpeza em `app/config.py` ou melhore a segmentação dos balões.
+
+### Nenhum balão detectado
+
+Possíveis causas:
+
+- O modelo `bubble_seg.pt` não foi treinado para esse estilo de mangá.
+- A imagem está em baixa resolução.
+- O balão tem formato incomum.
+- A confiança do YOLO está alta demais.
+
+Confira se o modelo carregou corretamente e veja os arquivos de debug gerados em `output/`:
+
+```powershell
+python -c "from ultralytics import YOLO; m=YOLO('models/bubble_seg.pt'); print(m.names)"
+```
+
+### Tradução falhando por internet
+
+O modelo de tradução é local via Hugging Face. Se um balão falhar, ele é ignorado sem cancelar os outros; a página falha apenas quando nenhuma tradução válida é renderizada.
+
+### OCR lento na primeira execução
+
+O PaddleOCR pode demorar na primeira execução por carregamento inicial dos modelos. Depois disso, a execução tende a ser mais rápida.
+
+## Limitações Atuais
+
+- Páginas reais de mangá variam muito em qualidade, resolução, contraste e estilo visual.
+- A qualidade da detecção depende diretamente do modelo `models/bubble_seg.pt`.
+- O OCR pode falhar em fontes muito estilizadas, texto inclinado, ruído ou baixa resolução.
+- A limpeza do texto original ainda pode falhar em alguns balões, especialmente quando há arte ou sombras dentro do balão.
+- A tradução automática pode não preservar contexto, tom, gênero ou estilo de fala com perfeição, mesmo com o modo Natural.
+- O app foi pensado para uso local e processamento de imagens individuais, não para produção em lote em larga escala.
+
+## Melhorias Futuras
+
+- Treinar um modelo próprio de segmentação com mais exemplos de mangá.
+- Melhorar o debug visual dos balões e máscaras dentro da interface.
+- Implementar técnicas de inpainting mais avançadas.
+- Suporte a mais idiomas de origem e destino.
+- Processamento em lote de várias páginas.
+- Melhor posicionamento de texto para balões inclinados ou muito irregulares.
+- Presets de limpeza para mangá preto e branco, webtoon colorido e scans antigos.
+
+## Licença
+
+Defina a licença desejada antes da publicação final.

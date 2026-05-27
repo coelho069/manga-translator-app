@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import uuid
 from datetime import datetime
@@ -9,18 +10,84 @@ import cv2
 import numpy as np
 from PIL import Image
 
-TRANSLATION_MODES = {
-    "en_to_pt": {
-        "label": "Inglês → Português",
-        "source_lang": "en",
+TRANSLATION_FLOWS = {
+    "auto_to_en": {
+        "label": "Auto → Inglês",
+        "source_lang": "auto",
+        "target_lang": "en",
+        "ocr_lang": "japan",
+    },
+    "auto_to_pt": {
+        "label": "Auto → Português",
+        "source_lang": "auto",
         "target_lang": "pt",
-        "ocr_lang": "en",
+        "ocr_lang": "japan",
     },
     "ja_to_en": {
         "label": "Japonês → Inglês",
         "source_lang": "ja",
         "target_lang": "en",
         "ocr_lang": "japan",
+    },
+    "ja_to_pt": {
+        "label": "Japonês → Português",
+        "source_lang": "ja",
+        "target_lang": "pt",
+        "ocr_lang": "japan",
+    },
+    "en_to_pt": {
+        "label": "Inglês → Português",
+        "source_lang": "en",
+        "target_lang": "pt",
+        "ocr_lang": "en",
+    },
+    "zh_to_en": {
+        "label": "Chinês → Inglês",
+        "source_lang": "zh",
+        "target_lang": "en",
+        "ocr_lang": "ch",
+    },
+    "zh_to_pt": {
+        "label": "Chinês → Português",
+        "source_lang": "zh",
+        "target_lang": "pt",
+        "ocr_lang": "ch",
+    },
+    "ko_to_en": {
+        "label": "Coreano → Inglês",
+        "source_lang": "ko",
+        "target_lang": "en",
+        "ocr_lang": "korean",
+    },
+    "ko_to_pt": {
+        "label": "Coreano → Português",
+        "source_lang": "ko",
+        "target_lang": "pt",
+        "ocr_lang": "korean",
+    },
+    "ru_to_en": {
+        "label": "Russo → Inglês",
+        "source_lang": "ru",
+        "target_lang": "en",
+        "ocr_lang": "ru",
+    },
+    "ru_to_pt": {
+        "label": "Russo → Português",
+        "source_lang": "ru",
+        "target_lang": "pt",
+        "ocr_lang": "ru",
+    },
+    "es_to_en": {
+        "label": "Espanhol → Inglês",
+        "source_lang": "es",
+        "target_lang": "en",
+        "ocr_lang": "en",
+    },
+    "es_to_pt": {
+        "label": "Espanhol → Português",
+        "source_lang": "es",
+        "target_lang": "pt",
+        "ocr_lang": "en",
     },
 }
 
@@ -35,6 +102,19 @@ def read_image_cv2(path: Path | str) -> np.ndarray:
     image = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if image is None:
         raise ValueError(f"Nao foi possivel ler a imagem: {path}")
+    try:
+        max_side = int(os.getenv("MAX_INPUT_IMAGE_SIDE", "0") or "0")
+    except ValueError:
+        max_side = 0
+    if max_side > 0:
+        h, w = image.shape[:2]
+        longest = max(h, w)
+        if longest > max_side:
+            scale = max_side / float(longest)
+            new_w = max(1, int(round(w * scale)))
+            new_h = max(1, int(round(h * scale)))
+            image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            print(f"[RESIZE] input downscaled from {w}x{h} to {new_w}x{new_h} (max_side={max_side})")
     return image
 
 
@@ -64,45 +144,30 @@ def safe_text(value) -> str:
 
 
 def normalize_source_lang(value) -> str:
-    lang = safe_text(value).lower().replace("_", "-")
-    aliases = {
-        "en": "en",
-        "eng": "en",
-        "english": "en",
-        "ingles": "en",
-        "inglês": "en",
-        "pt": "pt",
-        "pt-br": "pt",
-        "portugues": "pt",
-        "português": "pt",
-        "portuguese": "pt",
-        "zh": "zh-CN",
-        "zh-cn": "zh-CN",
-        "zh-hans": "zh-CN",
-        "cn": "zh-CN",
-        "ch": "zh-CN",
-        "chi": "zh-CN",
-        "chinese": "zh-CN",
-        "chines": "zh-CN",
-        "chinês": "zh-CN",
-        "chines simplificado": "zh-CN",
-        "chinês simplificado": "zh-CN",
-        "ja": "ja",
-        "jp": "ja",
-        "jpn": "ja",
-        "japan": "ja",
-        "japanese": "ja",
-        "japones": "ja",
-        "japonês": "ja",
-    }
-    return aliases.get(lang, "en")
+    # Delegate to the multilingual normalizer so OCR / UI / API share one map.
+    from app.translator import normalize_lang_code
+
+    return normalize_lang_code(value, default="auto")
 
 
 def resolve_ocr_lang(value) -> str:
     normalized = normalize_source_lang(value)
-    if normalized == "zh-CN":
-        return "ch"
-    if normalized == "ja":
+    ocr_map = {
+        "zh": "ch",
+        "ja": "japan",
+        "ko": "korean",
+        "ru": "ru",
+        "ar": "arabic",
+        "en": "en",
+        "pt": "pt",
+        "es": "es",
+        "fr": "fr",
+        "de": "de",
+        "it": "it",
+    }
+    if normalized in ocr_map:
+        return ocr_map[normalized]
+    if normalized == "auto":
         return "japan"
     return "en"
 
@@ -111,29 +176,43 @@ def resolve_translation_lang(value) -> str:
     return normalize_source_lang(value)
 
 
-def resolve_translation_mode(value) -> str:
+def resolve_translation_flow(value) -> str:
     raw = safe_text(value).lower().replace("-", "_")
     aliases = {
-        "en_to_pt": "en_to_pt",
-        "ingles_para_portugues": "en_to_pt",
-        "inglês_para_português": "en_to_pt",
-        "inglês_→_português": "en_to_pt",
-        "english_to_portuguese": "en_to_pt",
-        "ja_to_en": "ja_to_en",
         "japones_para_ingles": "ja_to_en",
         "japonês_para_inglês": "ja_to_en",
         "japonês_→_inglês": "ja_to_en",
         "japanese_to_english": "ja_to_en",
+        "japones_para_portugues": "ja_to_pt",
+        "japonês_para_português": "ja_to_pt",
+        "japanese_to_portuguese": "ja_to_pt",
+        "ch_to_en": "zh_to_en",
+        "chines_para_ingles": "zh_to_en",
+        "chinese_to_english": "zh_to_en",
+        "ingles_para_portugues": "en_to_pt",
+        "english_to_portuguese": "en_to_pt",
+        "coreano_para_ingles": "ko_to_en",
+        "korean_to_english": "ko_to_en",
+        "russo_para_portugues": "ru_to_pt",
+        "russian_to_portuguese": "ru_to_pt",
+        "espanhol_para_ingles": "es_to_en",
+        "spanish_to_english": "es_to_en",
+        "auto_to_en": "auto_to_en",
+        "auto_to_pt": "auto_to_pt",
     }
     mode = aliases.get(raw, raw)
-    if mode not in TRANSLATION_MODES:
-        return "en_to_pt"
+    if mode not in TRANSLATION_FLOWS:
+        # Default to the env-configured fallback when nothing matches.
+        import os
+
+        default_flow = os.getenv("DEFAULT_TRANSLATION_FLOW", "auto_to_en")
+        return default_flow if default_flow in TRANSLATION_FLOWS else "auto_to_en"
     return mode
 
 
-def get_translation_mode_config(value) -> dict[str, str]:
-    mode = resolve_translation_mode(value)
-    config = TRANSLATION_MODES[mode]
+def get_translation_flow_config(value) -> dict[str, str]:
+    mode = resolve_translation_flow(value)
+    config = TRANSLATION_FLOWS[mode]
     return {
         "mode": mode,
         "label": safe_text(config.get("label")),
@@ -143,8 +222,8 @@ def get_translation_mode_config(value) -> dict[str, str]:
     }
 
 
-def get_translation_mode_labels() -> dict[str, str]:
-    return {mode: safe_text(config.get("label")) for mode, config in TRANSLATION_MODES.items()}
+def get_translation_flow_labels() -> dict[str, str]:
+    return {mode: safe_text(config.get("label")) for mode, config in TRANSLATION_FLOWS.items()}
 
 
 def sanitize_filename(filename: str) -> str:

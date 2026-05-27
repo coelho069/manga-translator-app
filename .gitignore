@@ -4,23 +4,9 @@ __pycache__/
 *.pyc
 *.py[cod]
 .cache/
-output/*
-!output/.gitkeep
-outputs/
-models/*.pt
-runs/
-logs/
-*.log
-*.tmp
-tmp/
-temp/
-uploads/
-debug_cleanup/
 .pytest_cache/
-.streamlit/secrets.toml
-manga109-segmentation-bubble/
 
-# Secrets / credentials (never commit)
+# env/secrets
 .env
 .env.*
 !.env.example
@@ -31,6 +17,26 @@ credentials/
 token*
 *_token*
 *_key*
+.streamlit/secrets.toml
+.openclaude/settings.local.json
 
-# Runtime state (logs session keys + IPs; rotates per request)
+# runtime data
+data/keys.json
 data/sessions.json
+output/*
+!output/.gitkeep
+outputs/
+uploads/
+logs/
+runs/
+tmp/
+temp/
+debug_cleanup/
+*.log
+*.tmp
+*.tar.gz
+
+# local models/cache
+models/*.pt
+models/huggingface/
+manga109-segmentation-bubble/

@@ -3,13 +3,20 @@ from __future__ import annotations
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
+from time import time
+from uuid import uuid4
 import zipfile
 
 import streamlit as st
 
-from app.backend import create_batch_zip, process_batch, process_uploaded_image
+from app.backend import process_uploaded_image
 from app.pdf_utils import get_pdf_page_count, iter_pdf_pages
-from app.utils import ensure_dir, get_translation_mode_config, get_translation_mode_labels
+from app.utils import ensure_dir, get_translation_flow_config, get_translation_flow_labels
+
+
+translation_style = "natural"
+translation_style_label = "Natural"
+debug_enabled = False
 
 
 def clean_text(value) -> str:
@@ -28,19 +35,27 @@ def page_job_key(
     file_hash_value: str,
     file_name: str,
     page_number: int,
-    translation_mode: str,
+    translation_flow: str,
     source_lang: str,
     target_lang: str,
     ocr_lang: str,
+    ocr_engine: str,
+    performance_mode: str,
+    translation_style: str,
+    translation_provider: str,
 ) -> str:
     digest = sha256()
     digest.update(str(file_hash_value).encode("utf-8", errors="ignore"))
     digest.update(clean_text(file_name).encode("utf-8", errors="ignore"))
     digest.update(f"_page_{page_number}_".encode("utf-8"))
-    digest.update(clean_text(translation_mode).encode("utf-8", errors="ignore"))
+    digest.update(clean_text(translation_flow).encode("utf-8", errors="ignore"))
     digest.update(clean_text(source_lang).encode("utf-8", errors="ignore"))
     digest.update(clean_text(target_lang).encode("utf-8", errors="ignore"))
     digest.update(clean_text(ocr_lang).encode("utf-8", errors="ignore"))
+    digest.update(clean_text(ocr_engine).encode("utf-8", errors="ignore"))
+    digest.update(clean_text(performance_mode).encode("utf-8", errors="ignore"))
+    digest.update(clean_text(translation_style).encode("utf-8", errors="ignore"))
+    digest.update(clean_text(translation_provider).encode("utf-8", errors="ignore"))
     return digest.hexdigest()
 
 
@@ -49,6 +64,73 @@ def init_state() -> None:
         st.session_state["translated_pages"] = {}
     if "translation_errors" not in st.session_state:
         st.session_state["translation_errors"] = {}
+    if "realtime_jobs" not in st.session_state:
+        st.session_state["realtime_jobs"] = {}
+    if "realtime_active_jobs" not in st.session_state:
+        st.session_state["realtime_active_jobs"] = set()
+
+
+def create_realtime_job(total_pages: int) -> str:
+    job_id = uuid4().hex[:12]
+    st.session_state["realtime_jobs"][job_id] = {
+        "job_id": job_id,
+        "created_at": time(),
+        "total_pages": int(total_pages),
+        "status": "pending",
+        "current_page": 0,
+        "pages": {idx: {"page": idx, "status": "pending", "error": ""} for idx in range(1, int(total_pages) + 1)},
+        "error": "",
+    }
+    print(f"[REALTIME] job_created job_id={job_id}")
+    return job_id
+
+
+def set_job_status(job_id: str, status: str, page: int = 0, error: str = "") -> None:
+    jobs = st.session_state.get("realtime_jobs", {})
+    job = jobs.get(job_id)
+    if not job:
+        return
+    job["status"] = clean_text(status) or job["status"]
+    if page > 0:
+        job["current_page"] = int(page)
+    if error:
+        job["error"] = clean_text(error)
+
+
+def set_page_status(job_id: str, page: int, status: str, error: str = "") -> None:
+    jobs = st.session_state.get("realtime_jobs", {})
+    job = jobs.get(job_id)
+    if not job:
+        return
+    page_key = int(page)
+    page_state = job["pages"].setdefault(
+        page_key,
+        {
+            "page": page_key,
+            "status": "pending",
+            "error": "",
+        },
+    )
+    page_state["status"] = clean_text(status) or page_state["status"]
+    if error:
+        page_state["error"] = clean_text(error)
+    job["current_page"] = max(int(job.get("current_page") or 0), page_key)
+
+
+def render_realtime_panel(container, job_id: str) -> None:
+    job = st.session_state.get("realtime_jobs", {}).get(job_id) or {}
+    total_pages = int(job.get("total_pages") or 0)
+    current_page = int(job.get("current_page") or 0)
+    status = clean_text(job.get("status")) or "pending"
+    pages = job.get("pages") or {}
+
+    with container.container():
+        st.markdown("## Progresso em tempo real")
+        st.caption(f"job_id={job_id}")
+        st.text(f"Status: {status} | Pagina atual: {current_page}/{total_pages}")
+        ordered_pages = [pages[key] for key in sorted(pages.keys())]
+        if ordered_pages:
+            st.table(ordered_pages)
 
 
 def normalize_cache_entry(value):
@@ -57,11 +139,38 @@ def normalize_cache_entry(value):
     if isinstance(value, dict):
         translated_path = clean_text(value.get("translated_path"))
         if translated_path:
-            return {"translated_path": translated_path}
+            return {"translated_path": translated_path, "timings": value.get("timings") or {}}
     translated_path = getattr(value, "translated_image_path", None)
     if translated_path:
-        return {"translated_path": str(translated_path)}
+        return {"translated_path": str(translated_path), "timings": getattr(value, "metadata", {}).get("timings", {})}
     return None
+
+
+def format_timings(timings) -> str:
+    if not isinstance(timings, dict):
+        return ""
+    parts = []
+    for key in ("detect", "ocr", "translate", "clean", "render", "total"):
+        value = timings.get(key)
+        if isinstance(value, (int, float)):
+            parts.append(f"{key}={value:.1f}s")
+    return " | ".join(parts)
+
+
+def validate_pipeline_result(result) -> None:
+    metadata = getattr(result, "metadata", {}) or {}
+    translated_count = int(metadata.get("translated_count") or 0)
+    rendered_count = int(metadata.get("rendered_count") or 0)
+    detected_count = int(metadata.get("detected_count") or metadata.get("bubble_count") or 0)
+    if translated_count > 0 and rendered_count <= 0:
+        skipped = metadata.get("skipped_bubbles") or []
+        details = "; ".join(clean_text(item.get("notes")) for item in skipped if isinstance(item, dict))
+        message = "Texto traduzido mas limpeza/renderizacao falhou em todos os baloes."
+        if details:
+            message = f"{message} Motivos: {details}"
+        raise RuntimeError(message)
+    elif detected_count > 0 and translated_count <= 0:
+        raise RuntimeError("Baloes detectados, mas nenhuma traducao valida foi gerada para renderizar.")
 
 
 def render_page_success(slot, page_number: int, translated_path: Path, job_key: str) -> None:
@@ -163,49 +272,44 @@ init_state()
 
 st.title("Manga Translator")
 st.caption("Upload de imagens ou PDF. Traducao automatica pagina por pagina em modo vertical.")
+st.caption("Motor de traducao: usa traducao leve por padrao para nao sobrecarregar VPS pequena.")
 
-mode_labels = get_translation_mode_labels()
+mode_labels = get_translation_flow_labels()
 label_to_mode = {label: mode for mode, label in mode_labels.items()}
 selected_mode_label = st.selectbox("Modo de traducao", list(label_to_mode.keys()), index=0)
 selected_mode = label_to_mode[selected_mode_label]
-selected_mode_config = get_translation_mode_config(selected_mode)
+selected_mode_config = get_translation_flow_config(selected_mode)
 source_lang = selected_mode_config["source_lang"]
 target_lang = selected_mode_config["target_lang"]
 ocr_lang = selected_mode_config["ocr_lang"]
-translation_mode = selected_mode_config["mode"]
-translation_mode_label = selected_mode_config["label"]
+translation_flow = selected_mode_config["mode"]
+translation_flow_label = selected_mode_config["label"]
 
-with st.sidebar:
-    st.markdown("### Performance")
-    perf_mode_label = st.selectbox(
-        "Modo de processamento",
-        ["Rapido", "Equilibrado", "Qualidade"],
-        index=1,
-    )
-    perf_mode_map = {"Rapido": "fast", "Equilibrado": "balanced", "Qualidade": "quality"}
-    performance_mode = perf_mode_map[perf_mode_label]
+ocr_engine_labels = {
+    "Automático": "auto",
+    "PaddleOCR": "paddle",
+    "Manga OCR": "manga",
+}
+selected_ocr_engine_label = st.selectbox("Motor de OCR", list(ocr_engine_labels.keys()), index=0)
+ocr_engine = ocr_engine_labels[selected_ocr_engine_label]
+st.caption("Manga OCR é recomendado para texto japonês de mangá.")
 
-    use_translation_cache = st.checkbox("Usar cache de traducao", value=True)
-    debug_enabled = not st.checkbox("Desativar debug para acelerar", value=True)
+performance_labels = {
+    "Rapido": "fast",
+    "Equilibrado": "balanced",
+    "Qualidade": "quality",
+}
+selected_performance_label = st.selectbox("Desempenho", list(performance_labels.keys()), index=0)
+performance_mode = performance_labels[selected_performance_label]
+performance_label = selected_performance_label
+st.caption(
+    "Tradução multilíngue local. Configure via env: "
+    "TRANSLATION_PROVIDER, TRANSLATION_MODEL, DEFAULT_SOURCE_LANG, DEFAULT_TARGET_LANG."
+)
 
-    st.markdown("### Configuracao de Fonte")
-    min_font_size = st.slider("Tamanho minimo da fonte", min_value=6, max_value=24, value=9, step=1)
-    max_font_size = st.slider("Tamanho maximo da fonte", min_value=12, max_value=64, value=32, step=1)
-    if min_font_size > max_font_size:
-        min_font_size = max_font_size
-    line_spacing_ratio = st.slider("Espacamento entre linhas", min_value=0.8, max_value=2.0, value=1.12, step=0.02)
-    auto_font_resize = st.checkbox("Ajuste automatico da fonte", value=True)
-    center_text = st.checkbox("Centralizar texto", value=True)
-    bold_text = st.checkbox("Negrito", value=False)
-    text_color_hex = st.color_picker("Cor da fonte", value="#000000")
-    text_color = (
-        int(text_color_hex[1:3], 16),
-        int(text_color_hex[3:5], 16),
-        int(text_color_hex[5:7], 16),
-    )
+import os as _os
 
-translation_style = "natural"
-translation_style_label = "Natural"
+translation_provider = _os.getenv("TRANSLATION_PROVIDER", "multilingual")
 
 uploaded_files = st.file_uploader(
     "Envie imagens ou PDF de manga",
@@ -226,92 +330,379 @@ status_placeholder.info("Lendo arquivos enviados...")
 inputs, total_pages = gather_inputs(uploaded_files, status_placeholder)
 if total_pages <= 0:
     st.stop()
+print("[REALTIME] upload_received")
+job_id = create_realtime_job(total_pages)
+if job_id in st.session_state["realtime_active_jobs"]:
+    status_placeholder.warning("Job ja em processamento. Aguarde terminar.")
+    st.stop()
+st.session_state["realtime_active_jobs"].add(job_id)
+set_job_status(job_id, "loading")
+print(f"[REALTIME] processing_started job_id={job_id}")
+realtime_panel = st.empty()
+render_realtime_panel(realtime_panel, job_id)
 
 output_pdf_pages_dir = ensure_dir(Path("output") / "_pdf_pages")
+try:
+    _pdf_dpi_fast = int(_os.getenv("PDF_DPI_FAST", "110") or "110")
+    _pdf_dpi_default = int(_os.getenv("PDF_DPI_DEFAULT", "130") or "130")
+except ValueError:
+    _pdf_dpi_fast, _pdf_dpi_default = 110, 130
+pdf_dpi = _pdf_dpi_fast if performance_mode == "fast" else _pdf_dpi_default
 
-all_batch_files: list[tuple[str, bytes]] = []
-page_display_info: list[tuple[int, str]] = []
-
+translated_for_zip: list[tuple[int, Path]] = []
 global_page_counter = 0
+finished_pages = 0
+
 for file_idx, file_item in enumerate(inputs, start=1):
     file_kind = file_item["kind"]
     file_name = file_item["name"]
     file_content = file_item["content"]
+    hash_value = file_item["hash"]
 
     if file_kind == "pdf_error":
         global_page_counter += 1
-        page_display_info.append((global_page_counter, file_name))
+        finished_pages += 1
+        set_page_status(job_id, global_page_counter, "failed", file_item["error"])
+        print(f"[REALTIME_ERROR] job_id={job_id} page={global_page_counter} stage=loading error={clean_text(file_item['error'])}")
+        render_realtime_panel(realtime_panel, job_id)
+        slot = st.empty()
+        job_key = page_job_key(
+            hash_value,
+            file_name,
+            1,
+            translation_flow,
+            source_lang,
+            target_lang,
+            ocr_lang,
+            ocr_engine,
+            performance_mode,
+            translation_style,
+            translation_provider,
+        )
+        st.session_state["translation_errors"][job_key] = {"message": file_item["error"]}
+        status_placeholder.warning(f"Nao foi possivel abrir o PDF {file_name}.")
+        render_page_error(slot, global_page_counter, file_item["error"])
+        overall_progress.progress(int((finished_pages / total_pages) * 100))
         continue
 
     if file_kind == "image":
+        page_number_in_file = 1
         global_page_counter += 1
-        all_batch_files.append((file_name, file_content))
-        page_display_info.append((global_page_counter, file_name))
+        set_page_status(job_id, global_page_counter, "loading")
+        set_job_status(job_id, "loading", page=global_page_counter)
+        print(f"[REALTIME] page_loaded job_id={job_id} page={global_page_counter}")
+        render_realtime_panel(realtime_panel, job_id)
+        job_key = page_job_key(
+            hash_value,
+            file_name,
+            page_number_in_file,
+            translation_flow,
+            source_lang,
+            target_lang,
+            ocr_lang,
+            ocr_engine,
+            performance_mode,
+            translation_style,
+            translation_provider,
+        )
+        slot = st.empty()
+
+        cached_result = normalize_cache_entry(st.session_state["translated_pages"].get(job_key))
+        cached_error = st.session_state["translation_errors"].get(job_key)
+
+        if cached_result is not None:
+            translated_path = Path(cached_result["translated_path"])
+            if translated_path.exists():
+                render_page_success(slot, global_page_counter, translated_path, job_key)
+                translated_for_zip.append((global_page_counter, translated_path))
+                timing_summary = format_timings(cached_result.get("timings"))
+                status_placeholder.info(
+                    f"Pagina {global_page_counter} reutilizada do cache"
+                    + (f" ({timing_summary})" if timing_summary else ".")
+                )
+            else:
+                st.session_state["translated_pages"].pop(job_key, None)
+                st.session_state["translation_errors"][job_key] = {"message": "Arquivo traduzido nao encontrado no cache."}
+                render_page_error(slot, global_page_counter, "Arquivo traduzido nao encontrado no cache.")
+            finished_pages += 1
+            overall_progress.progress(int((finished_pages / total_pages) * 100))
+            continue
+
+        if cached_error is not None:
+            render_page_error(slot, global_page_counter, clean_text(cached_error.get("message")))
+            finished_pages += 1
+            overall_progress.progress(int((finished_pages / total_pages) * 100))
+            continue
+
+        status_placeholder.info(
+            f"Usando Manga OCR... Traduzindo pagina {global_page_counter} de {total_pages} · {translation_flow_label}..."
+            if ocr_engine == "manga" or (ocr_engine == "auto" and ocr_lang in {"japan", "ja", "japanese"})
+            else f"Traduzindo pagina {global_page_counter} de {total_pages} · {translation_flow_label}..."
+        )
+
+        def update_progress(value: float, message: str, meta=None) -> None:
+            stage_id = clean_text((meta or {}).get("stage_id")) if isinstance(meta, dict) else ""
+            stage_map = {
+                "load_image": "loading",
+                "detect": "detecting_balloons",
+                "ocr": "ocr",
+                "translate": "translating",
+                "clean": "cleaning",
+                "render": "rendering",
+                "finish": "done",
+            }
+            mapped_status = stage_map.get(stage_id, "")
+            if mapped_status:
+                set_page_status(job_id, global_page_counter, mapped_status)
+                set_job_status(job_id, mapped_status, page=global_page_counter)
+                if mapped_status == "detecting_balloons":
+                    print(f"[REALTIME] detecting_balloons job_id={job_id} page={global_page_counter}")
+                elif mapped_status == "ocr":
+                    print(f"[REALTIME] ocr_start job_id={job_id} page={global_page_counter}")
+                elif mapped_status == "translating":
+                    print(f"[REALTIME] translation_start job_id={job_id} page={global_page_counter}")
+                elif mapped_status == "cleaning":
+                    print(f"[REALTIME] cleaning_start job_id={job_id} page={global_page_counter}")
+                elif mapped_status == "rendering":
+                    print(f"[REALTIME] rendering_start job_id={job_id} page={global_page_counter}")
+                render_realtime_panel(realtime_panel, job_id)
+            del message
+            local_value = float(max(0.0, min(1.0, value)))
+            absolute_progress = ((finished_pages + local_value) / total_pages) * 100.0
+            overall_progress.progress(int(max(0, min(100, round(absolute_progress)))))
+
+        try:
+            result = process_uploaded_image(
+                filename=file_name,
+                content=file_content,
+                translation_flow=translation_flow,
+                source_lang=source_lang,
+                target_lang=target_lang,
+                ocr_lang=ocr_lang,
+                ocr_engine=ocr_engine,
+                translation_style=translation_style,
+                performance_mode=performance_mode,
+                translation_provider=translation_provider,
+                debug_enabled=debug_enabled,
+                progress_callback=update_progress,
+            )
+            validate_pipeline_result(result)
+            set_page_status(job_id, global_page_counter, "done")
+            print(f"[REALTIME] ocr_done job_id={job_id} page={global_page_counter}")
+            print(f"[REALTIME] translation_done job_id={job_id} page={global_page_counter}")
+            print(f"[REALTIME] cleaning_done job_id={job_id} page={global_page_counter}")
+            print(f"[REALTIME] rendering_done job_id={job_id} page={global_page_counter}")
+            translated_path = Path(result.translated_image_path)
+            timings = result.metadata.get("timings", {}) if isinstance(result.metadata, dict) else {}
+            st.session_state["translated_pages"][job_key] = {
+                "translated_path": str(translated_path),
+                "timings": timings,
+            }
+            st.session_state["translation_errors"].pop(job_key, None)
+            render_page_success(slot, global_page_counter, translated_path, job_key)
+            translated_for_zip.append((global_page_counter, translated_path))
+            timing_summary = format_timings(timings)
+            status_placeholder.success(
+                f"Pagina {global_page_counter} concluida. ({translation_flow_label} · {performance_label})"
+                + (f" {timing_summary}" if timing_summary else "")
+            )
+            print(f"[REALTIME] page_done job_id={job_id} page={global_page_counter}")
+            render_realtime_panel(realtime_panel, job_id)
+        except Exception as exc:
+            message = clean_text(exc) or f"Falha na pagina {global_page_counter}."
+            set_page_status(job_id, global_page_counter, "failed", message)
+            st.session_state["translation_errors"][job_key] = {"message": message}
+            render_page_error(slot, global_page_counter, message)
+            status_placeholder.warning(f"Nao foi possivel traduzir a pagina {global_page_counter}.")
+            print(f"[REALTIME_ERROR] job_id={job_id} page={global_page_counter} stage=processing error={message}")
+            render_realtime_panel(realtime_panel, job_id)
+        finally:
+            finished_pages += 1
+            overall_progress.progress(int((finished_pages / total_pages) * 100))
         continue
 
-    temp_pdf_dir = ensure_dir(output_pdf_pages_dir / f"pdf_{file_idx}_{file_item['hash']}")
-    for page_number_in_file, total_pdf_pages, page_path in iter_pdf_pages(file_content, temp_pdf_dir, dpi=220):
+    # PDF
+    temp_pdf_dir = ensure_dir(output_pdf_pages_dir / f"pdf_{file_idx}_{hash_value}")
+    status_placeholder.info(f"Lendo PDF: {file_name}")
+
+    for page_number_in_file, total_pdf_pages, page_path in iter_pdf_pages(file_content, temp_pdf_dir, dpi=pdf_dpi):
         global_page_counter += 1
+        set_page_status(job_id, global_page_counter, "loading")
+        set_job_status(job_id, "loading", page=global_page_counter)
+        print(f"[REALTIME] page_loaded job_id={job_id} page={global_page_counter}")
+        render_realtime_panel(realtime_panel, job_id)
+        job_key = page_job_key(
+            hash_value,
+            file_name,
+            page_number_in_file,
+            translation_flow,
+            source_lang,
+            target_lang,
+            ocr_lang,
+            ocr_engine,
+            performance_mode,
+            translation_style,
+            translation_provider,
+        )
+        slot = st.empty()
+
+        cached_result = normalize_cache_entry(st.session_state["translated_pages"].get(job_key))
+        cached_error = st.session_state["translation_errors"].get(job_key)
+
+        if cached_result is not None:
+            translated_path = Path(cached_result["translated_path"])
+            if translated_path.exists():
+                render_page_success(slot, global_page_counter, translated_path, job_key)
+                translated_for_zip.append((global_page_counter, translated_path))
+                timing_summary = format_timings(cached_result.get("timings"))
+                status_placeholder.info(
+                    f"Pagina {global_page_counter} reutilizada do cache"
+                    + (f" ({timing_summary})" if timing_summary else ".")
+                )
+            else:
+                st.session_state["translated_pages"].pop(job_key, None)
+                st.session_state["translation_errors"][job_key] = {"message": "Arquivo traduzido nao encontrado no cache."}
+                render_page_error(slot, global_page_counter, "Arquivo traduzido nao encontrado no cache.")
+            finished_pages += 1
+            set_page_status(job_id, global_page_counter, "done")
+            print(f"[REALTIME] page_done job_id={job_id} page={global_page_counter}")
+            render_realtime_panel(realtime_panel, job_id)
+            overall_progress.progress(int((finished_pages / total_pages) * 100))
+            if page_path.exists():
+                page_path.unlink(missing_ok=True)
+            status_placeholder.success(f"Pagina {global_page_counter} concluida. ({translation_flow_label})")
+            continue
+
+        if cached_error is not None:
+            render_page_error(slot, global_page_counter, clean_text(cached_error.get("message")))
+            finished_pages += 1
+            set_page_status(job_id, global_page_counter, "failed", clean_text(cached_error.get("message")))
+            print(f"[REALTIME_ERROR] job_id={job_id} page={global_page_counter} stage=cache error={clean_text(cached_error.get('message'))}")
+            render_realtime_panel(realtime_panel, job_id)
+            overall_progress.progress(int((finished_pages / total_pages) * 100))
+            if page_path.exists():
+                page_path.unlink(missing_ok=True)
+            status_placeholder.warning(f"Nao foi possivel traduzir a pagina {global_page_counter}.")
+            continue
+
+        status_placeholder.info(f"Convertendo pagina {global_page_counter} de {total_pages}...")
         page_bytes = b""
         try:
             page_bytes = page_path.read_bytes()
-        except Exception:
-            pass
-        if page_bytes:
-            page_name = f"{Path(file_name).stem}_page_{page_number_in_file:04d}.png"
-            all_batch_files.append((page_name, page_bytes))
-            page_display_info.append((global_page_counter, page_name))
-        if page_path.exists():
-            page_path.unlink(missing_ok=True)
+        except Exception as exc:
+            message = clean_text(exc) or f"Falha ao ler pagina {global_page_counter}."
+            set_page_status(job_id, global_page_counter, "failed", message)
+            st.session_state["translation_errors"][job_key] = {"message": message}
+            render_page_error(slot, global_page_counter, message)
+            finished_pages += 1
+            print(f"[REALTIME_ERROR] job_id={job_id} page={global_page_counter} stage=loading error={message}")
+            render_realtime_panel(realtime_panel, job_id)
+            overall_progress.progress(int((finished_pages / total_pages) * 100))
+            if page_path.exists():
+                page_path.unlink(missing_ok=True)
+            continue
 
-if not all_batch_files:
-    status_placeholder.warning("Nenhum arquivo valido para processar.")
-    st.stop()
+        status_placeholder.info(
+            f"Usando Manga OCR... Traduzindo pagina {global_page_counter} de {total_pages} · {translation_flow_label}..."
+            if ocr_engine == "manga" or (ocr_engine == "auto" and ocr_lang in {"japan", "ja", "japanese"})
+            else f"Traduzindo pagina {global_page_counter} de {total_pages} · {translation_flow_label}..."
+        )
 
-status_placeholder.info(f"Processando {len(all_batch_files)} paginas em lote...")
+        def update_progress(value: float, message: str, meta=None) -> None:
+            stage_id = clean_text((meta or {}).get("stage_id")) if isinstance(meta, dict) else ""
+            stage_map = {
+                "load_image": "loading",
+                "detect": "detecting_balloons",
+                "ocr": "ocr",
+                "translate": "translating",
+                "clean": "cleaning",
+                "render": "rendering",
+                "finish": "done",
+            }
+            mapped_status = stage_map.get(stage_id, "")
+            if mapped_status:
+                set_page_status(job_id, global_page_counter, mapped_status)
+                set_job_status(job_id, mapped_status, page=global_page_counter)
+                if mapped_status == "detecting_balloons":
+                    print(f"[REALTIME] detecting_balloons job_id={job_id} page={global_page_counter}")
+                elif mapped_status == "ocr":
+                    print(f"[REALTIME] ocr_start job_id={job_id} page={global_page_counter}")
+                elif mapped_status == "translating":
+                    print(f"[REALTIME] translation_start job_id={job_id} page={global_page_counter}")
+                elif mapped_status == "cleaning":
+                    print(f"[REALTIME] cleaning_start job_id={job_id} page={global_page_counter}")
+                elif mapped_status == "rendering":
+                    print(f"[REALTIME] rendering_start job_id={job_id} page={global_page_counter}")
+                render_realtime_panel(realtime_panel, job_id)
+            del message
+            local_value = float(max(0.0, min(1.0, value)))
+            absolute_progress = ((finished_pages + local_value) / total_pages) * 100.0
+            overall_progress.progress(int(max(0, min(100, round(absolute_progress)))))
 
-def update_batch_progress(value: float, message: str, meta=None) -> None:
-    overall_progress.progress(int(max(0, min(100, round(value * 100)))))
+        try:
+            result = process_uploaded_image(
+                filename=f"{Path(file_name).stem}_page_{page_number_in_file:04d}.png",
+                content=page_bytes,
+                translation_flow=translation_flow,
+                source_lang=source_lang,
+                target_lang=target_lang,
+                ocr_lang=ocr_lang,
+                ocr_engine=ocr_engine,
+                translation_style=translation_style,
+                performance_mode=performance_mode,
+                translation_provider=translation_provider,
+                debug_enabled=debug_enabled,
+                progress_callback=update_progress,
+            )
+            validate_pipeline_result(result)
+            set_page_status(job_id, global_page_counter, "done")
+            print(f"[REALTIME] ocr_done job_id={job_id} page={global_page_counter}")
+            print(f"[REALTIME] translation_done job_id={job_id} page={global_page_counter}")
+            print(f"[REALTIME] cleaning_done job_id={job_id} page={global_page_counter}")
+            print(f"[REALTIME] rendering_done job_id={job_id} page={global_page_counter}")
+            translated_path = Path(result.translated_image_path)
+            timings = result.metadata.get("timings", {}) if isinstance(result.metadata, dict) else {}
+            st.session_state["translated_pages"][job_key] = {
+                "translated_path": str(translated_path),
+                "timings": timings,
+            }
+            st.session_state["translation_errors"].pop(job_key, None)
+            render_page_success(slot, global_page_counter, translated_path, job_key)
+            translated_for_zip.append((global_page_counter, translated_path))
+            timing_summary = format_timings(timings)
+            status_placeholder.success(
+                f"Pagina {global_page_counter} concluida. ({translation_flow_label} · {performance_label})"
+                + (f" {timing_summary}" if timing_summary else "")
+            )
+            print(f"[REALTIME] page_done job_id={job_id} page={global_page_counter}")
+            render_realtime_panel(realtime_panel, job_id)
+        except Exception as exc:
+            message = clean_text(exc) or f"Falha na pagina {global_page_counter}."
+            set_page_status(job_id, global_page_counter, "failed", message)
+            st.session_state["translation_errors"][job_key] = {"message": message}
+            render_page_error(slot, global_page_counter, message)
+            status_placeholder.warning(f"Nao foi possivel traduzir a pagina {global_page_counter}.")
+            print(f"[REALTIME_ERROR] job_id={job_id} page={global_page_counter} stage=processing error={message}")
+            render_realtime_panel(realtime_panel, job_id)
+        finally:
+            page_bytes = b""
+            if page_path.exists():
+                page_path.unlink(missing_ok=True)
+            finished_pages += 1
+            overall_progress.progress(int((finished_pages / total_pages) * 100))
 
-batch_results = process_batch(
-    files=all_batch_files,
-    translation_mode=translation_mode,
-    source_lang=source_lang,
-    target_lang=target_lang,
-    ocr_lang=ocr_lang,
-    translation_style=translation_style,
-    performance_mode=performance_mode,
-    debug_enabled=debug_enabled,
-    progress_callback=update_batch_progress,
-    min_font_size=min_font_size,
-    max_font_size=max_font_size,
-    line_spacing_ratio=line_spacing_ratio,
-    auto_font_resize=auto_font_resize,
-    center_text=center_text,
-    bold_text=bold_text,
-    text_color=text_color,
-)
-
-translated_for_zip: list[tuple[int, Path]] = []
-
-for idx, result in enumerate(batch_results):
-    page_num = idx + 1
-    slot = st.empty()
-    translated_path = Path(result.translated_image_path)
-    if translated_path.exists():
-        render_page_success(slot, page_num, translated_path, f"batch_{page_num}")
-        translated_for_zip.append((page_num, translated_path))
-    else:
-        render_page_error(slot, page_num, "Arquivo traduzido nao encontrado.")
-
-for err_idx in range(len(batch_results), len(all_batch_files)):
-    page_num = err_idx + 1
-    slot = st.empty()
-    render_page_error(slot, page_num, "Pagina nao processada.")
-
-status_placeholder.success(
-    f"Finalizado. {len(batch_results)}/{len(all_batch_files)} paginas traduzidas."
-)
+if not translated_for_zip:
+    status_placeholder.error("Finalizado com erro: nenhuma pagina traduzida.")
+    set_job_status(job_id, "failed", error="nenhuma pagina traduzida")
+elif len(translated_for_zip) < total_pages:
+    status_placeholder.warning(f"Finalizado com erros: {len(translated_for_zip)} de {total_pages} paginas traduzidas.")
+    set_job_status(job_id, "failed", error="finalizado com erros")
+else:
+    status_placeholder.success("Finalizado.")
+    set_job_status(job_id, "done")
+print(f"[REALTIME] job_done job_id={job_id}")
+st.session_state["realtime_active_jobs"].discard(job_id)
+render_realtime_panel(realtime_panel, job_id)
 
 if translated_for_zip:
     ordered = sorted(translated_for_zip, key=lambda item: item[0])
