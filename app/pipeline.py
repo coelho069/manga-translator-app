@@ -14,7 +14,7 @@ from app.ocr import OCRReader
 from app.renderer import TextRenderer
 from app.translator import (
     BaseTranslator,
-    Small100CT2Translator,
+    build_translator,
     is_translation_valid,
     normalize_lang_code,
     normalize_punctuation,
@@ -42,7 +42,7 @@ class MangaTranslatorPipeline:
         ensure_dir(self.config.output_dir)
         self.detector = BubbleDetector(self.config)
         self.ocr = OCRReader(self.config)
-        self.translator = translator or Small100CT2Translator(self.config)
+        self.translator = translator or build_translator(self.config)
         self.cleaner = BubbleCleaner(self.config)
         self.renderer = TextRenderer(self.config)
         self.debug_dir: Path | None = None

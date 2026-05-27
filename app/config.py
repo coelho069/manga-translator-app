@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -9,14 +10,14 @@ class AppConfig:
     hf_bubble_model_filename: str = "model.pt"
     auto_download_bubble_model: bool = True
     output_dir: Path = Path("output")
-    translation_provider: str = "small100_ct2"
-    translation_model: str = "entai2965/small100-ctranslate2"
-    translation_cache_enabled: bool = True
-    translation_timeout_seconds: int = 120
+    translation_provider: str = os.getenv("TRANSLATION_PROVIDER", "m2m100")
+    translation_model: str = os.getenv("TRANSLATION_MODEL", "facebook/m2m100_418M")
+    translation_cache_enabled: bool = os.getenv("TRANSLATION_CACHE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    translation_timeout_seconds: int = int(os.getenv("TRANSLATION_TIMEOUT_SECONDS", "180"))
     translation_beam_size: int = 4
     translation_mode: str = "en_to_pt"
-    source_lang: str = "en"
-    target_lang: str = "pt"
+    source_lang: str = os.getenv("DEFAULT_SOURCE_LANG", "auto")
+    target_lang: str = os.getenv("DEFAULT_TARGET_LANG", "pt")
     ocr_lang: str = "en"
     translation_style: str = "natural"
     performance_mode: str = "balanced"

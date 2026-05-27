@@ -4,6 +4,8 @@ numpy>=1.24.0,<2.0
 pillow>=10.0.0
 torch==2.2.2+cpu
 torchvision==0.17.2+cpu
+transformers>=4.40.0,<4.41
+safetensors>=0.4.3
 ultralytics==8.4.50
 paddleocr==2.7.3
 paddlepaddle==2.6.2
