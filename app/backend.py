@@ -199,31 +199,35 @@ def process_uploaded_image(
         hf_translation_model=model,
         debug_enabled=bool(debug_enabled),
     )
-    ensure_dir(config.output_dir)
-    job_dir = make_job_dir(config.output_dir)
+    import tempfile
+    import shutil
+    
+    # Use temporary directory for processing (auto-cleaned)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        job_dir = Path(temp_dir)
+        
+        safe_name = sanitize_filename(filename)
+        input_path = job_dir / safe_name
+        try:
+            input_path.write_bytes(content)
 
-    safe_name = sanitize_filename(filename)
-    input_path = Path(job_dir) / safe_name
-    try:
-        input_path.write_bytes(content)
-
-        print(f"[FLOW] processing_start job_dir={job_dir}")
-        print(f"[FLOW] page_start file={safe_name}")
-        with _single_page_processing(int(os.getenv("PIPELINE_LOCK_TIMEOUT_SECONDS", "30") or "30")):
-            pipeline = MangaTranslatorPipeline(config=config)
-            try:
-                result = pipeline.run(input_path, output_dir=job_dir, progress_callback=progress_callback)
-            finally:
-                # Drop the per-job pipeline (renderer/cleaner state) so its
-                # numpy buffers can be collected before the next page.
-                pipeline = None
-                _release_inference_memory()
-        print(f"[FLOW] page_done file={safe_name}")
-        print(f"[FLOW] processing_done job_dir={job_dir}")
-        return result
-    except Exception as exc:
-        print(f"[FLOW_ERROR] processing {exc}")
-        raise
+            print(f"[FLOW] processing_start job_dir={job_dir}")
+            print(f"[FLOW] page_start file={safe_name}")
+            with _single_page_processing(int(os.getenv("PIPELINE_LOCK_TIMEOUT_SECONDS", "30") or "30")):
+                pipeline = MangaTranslatorPipeline(config=config)
+                try:
+                    result = pipeline.run(input_path, output_dir=None, progress_callback=progress_callback)
+                finally:
+                    # Drop the per-job pipeline (renderer/cleaner state) so its
+                    # numpy buffers can be collected before the next page.
+                    pipeline = None
+                    _release_inference_memory()
+            print(f"[FLOW] page_done file={safe_name}")
+            print(f"[FLOW] processing_done job_dir={job_dir}")
+            return result
+        except Exception as exc:
+            print(f"[FLOW_ERROR] processing {exc}")
+            raise
 
 
 def _release_inference_memory() -> None:

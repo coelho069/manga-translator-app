@@ -11,8 +11,8 @@ def _env(name: str, default: str) -> str:
 @dataclass(frozen=True)
 class AppConfig:
     bubble_model_path: Path = Path("models/bubble_seg.pt")
-    hf_bubble_model_repo: str = "kitsumed/yolov8m_seg-speech-bubble"
-    hf_bubble_model_filename: str = "model.pt"
+    hf_bubble_model_repo: str = "huyvux3005/manga109-segmentation-bubble"
+    hf_bubble_model_filename: str = "best.pt"
     auto_download_bubble_model: bool = True
     output_dir: Path = Path("output")
     translation_flow: str = _env("DEFAULT_TRANSLATION_FLOW", "auto_to_en")

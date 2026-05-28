@@ -398,10 +398,11 @@ class MangaTranslatorPipeline:
             self._progress(progress_callback, 0.80, "nenhum balao detectado")
 
         self._progress(progress_callback, 0.96, "finalizando")
-        self._save_debug_image("debug_final_rendered.png", work_image)
-        self._save_debug_image("debug_final_translated.png", work_image)
-        self._save_debug_image("final.png", work_image)
-        self._save_debug_image("final_with_bbox.png", self._draw_debug_bboxes(work_image, bubbles))
+        # Skip debug image saving for mobile version
+        # self._save_debug_image("debug_final_rendered.png", work_image)
+        # self._save_debug_image("debug_final_translated.png", work_image)
+        # self._save_debug_image("final.png", work_image)
+        # self._save_debug_image("final_with_bbox.png", self._draw_debug_bboxes(work_image, bubbles))
 
         flow_report_list = self._finalize_flow_report(bubbles, flow_report)
         if flow_report_path is not None:
@@ -413,11 +414,15 @@ class MangaTranslatorPipeline:
         rendered_count = sum(1 for row in flow_report_list if row.get("render_ran"))
         cleanup_success_count = len(cleaned_bubble_ids)
 
-        output_path = Path(output_dir) / f"translated_{original_image_path.stem}.png"
+        # Convert image to bytes for mobile (no disk save)
         step_start = perf_counter()
-        write_image_cv2(output_path, work_image)
-        self._record_timing(timings, "save", step_start)
-        print(f"[FLOW] imagem final salva: {output_path}")
+        import cv2
+        success, buffer = cv2.imencode('.png', work_image)
+        if not success:
+            raise RuntimeError("Failed to encode image to PNG")
+        image_bytes = buffer.tobytes()
+        self._record_timing(timings, "encode", step_start)
+        
         _ocr_count = sum(1 for b in bubbles if b.source_text)
         _tr_count = sum(1 for b in bubbles if b.translated_text)
         _rn_count = sum(1 for row in flow_report.values() if row.get("render_ran"))
@@ -428,9 +433,10 @@ class MangaTranslatorPipeline:
 
         return AppResult(
             original_image_path=original_image_path,
-            translated_image_path=output_path,
+            translated_image_path=None,
             bubbles=bubbles,
-            output_dir=Path(output_dir),
+            output_dir=None,
+            image_bytes=image_bytes,
             metadata={
                 "bubble_count": len(bubbles),
                 "translation_flow": safe_text(self.config.translation_flow) or "auto_to_en",
@@ -446,18 +452,18 @@ class MangaTranslatorPipeline:
                 "ocr_count": ocr_count,
                 "translated_count": translated_count,
                 "rendered_count": rendered_count,
-                "cleanup_success_count": cleanup_success_count,
+                "cleanup_success_count": cleaned_bubble_ids,
                 "flow_success": bool(rendered_count > 0),
                 "total_time": timings.get("total", 0.0),
-                "bubble_flow_report_path": str(flow_report_path) if flow_report_path is not None else "",
+                "bubble_flow_report_path": "",
                 "cleaned_bubble_ids": sorted(cleaned_bubble_ids),
                 "skipped_bubbles": [
                     {"id": bubble.id, "notes": list(bubble.processing_notes)}
                     for bubble in bubbles
                     if bubble.processing_notes
                 ],
-                "debug_dir": str(self.debug_dir) if self.debug_dir is not None else "",
-            },
+                "debug_dir": "",
+            }
         )
 
     @staticmethod

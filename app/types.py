@@ -60,7 +60,8 @@ class SpeechBubble:
 @dataclass
 class AppResult:
     original_image_path: Path
-    translated_image_path: Path
-    bubbles: list[SpeechBubble]
-    output_dir: Path
-    metadata: dict[str, Any] = field(default_factory=dict)
+    bubbles: list
+    translated_image_path: Path | None = None
+    output_dir: Path | None = None
+    image_bytes: bytes | None = None
+    metadata: dict = field(default_factory=dict)

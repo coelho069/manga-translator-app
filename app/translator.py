@@ -34,12 +34,19 @@ from app.hf_auth import hf_auth_help_message, hf_auth_kwargs, is_hf_auth_error
 # --- Defaults -----------------------------------------------------------------
 
 DEFAULT_PROVIDER = "multilingual"
-DEFAULT_MODEL = "facebook/m2m100_418M"
+DEFAULT_MODEL = "facebook/nllb-200-distilled-600M"
 DEFAULT_SOURCE_LANG = "auto"
 DEFAULT_TARGET_LANG = "en"
 
-# Fallback specifically for the ja→en pair when the multilingual model fails.
-JA_EN_FALLBACK_MODEL = "Helsinki-NLP/opus-mt-ja-en"
+# NLLB-200 usa códigos ISO 639-3 com sufixo de script: por_Latn, eng_Latn, jpn_Jpan, etc.
+NLLB_LANG_MAP = {
+    "en": "eng_Latn", "pt": "por_Latn", "ja": "jpn_Jpan",
+    "es": "spa_Latn", "fr": "fra_Latn", "de": "deu_Latn",
+    "it": "ita_Latn", "ko": "kor_Hang", "zh": "zho_Hans",
+    "ru": "rus_Cyrl", "ar": "ara_Arab", "hi": "hin_Deva",
+    "auto": "auto",
+}
+
 
 # --- Script detection regexes -------------------------------------------------
 
@@ -166,6 +173,29 @@ def normalize_lang_code(value, *, default: str = "auto") -> str:
     return default
 
 
+# MBart-50 expects long region codes (en_XX, ja_XX, zh_CN, ...). Map the short
+# canonical codes used internally to the codes MBart's tokenizer knows about.
+_MBART_LANG_CODES: dict[str, str] = {
+    "ar": "ar_AR", "cs": "cs_CZ", "de": "de_DE", "en": "en_XX", "es": "es_XX",
+    "et": "et_EE", "fi": "fi_FI", "fr": "fr_XX", "gu": "gu_IN", "hi": "hi_IN",
+    "it": "it_IT", "ja": "ja_XX", "kk": "kk_KZ", "ko": "ko_KR", "lt": "lt_LT",
+    "lv": "lv_LV", "my": "my_MM", "ne": "ne_NP", "nl": "nl_XX", "ro": "ro_RO",
+    "ru": "ru_RU", "si": "si_LK", "tr": "tr_TR", "vi": "vi_VN", "zh": "zh_CN",
+    "af": "af_ZA", "az": "az_AZ", "bn": "bn_IN", "fa": "fa_IR", "he": "he_IL",
+    "hr": "hr_HR", "id": "id_ID", "ka": "ka_GE", "km": "km_KH", "mk": "mk_MK",
+    "ml": "ml_IN", "mn": "mn_MN", "mr": "mr_IN", "pl": "pl_PL", "ps": "ps_AF",
+    "pt": "pt_XX", "sv": "sv_SE", "sw": "sw_KE", "ta": "ta_IN", "te": "te_IN",
+    "th": "th_TH", "tl": "tl_XX", "uk": "uk_UA", "ur": "ur_PK", "xh": "xh_ZA",
+    "gl": "gl_ES", "sl": "sl_SI",
+}
+
+
+def _to_mbart_code(lang: str) -> str:
+    """Translate a short code (``ja``) into MBart's region code (``ja_XX``)."""
+    short = normalize_lang_code(lang, default="en")
+    return _MBART_LANG_CODES.get(short, "en_XX")
+
+
 # --- Errors / settings -------------------------------------------------------
 
 
@@ -288,7 +318,7 @@ class _Seq2SeqRuntime:
     model: object
     torch: object
     device: object
-    family: str  # "m2m100" | "small100" | "marian" | "ct2"
+    family: str  # "m2m100" | "nllb" | "small100" | "marian" | "ct2"
     model_id: str
 
 
@@ -341,6 +371,7 @@ def translate_text(
         tgt = settings.target_lang if settings.target_lang != "auto" else DEFAULT_TARGET_LANG
 
     balloon_tag = balloon_id if balloon_id is not None else 0
+    print(f"[TRANSLATOR_LANG] normalized_source={src} normalized_target={tgt}")
     print(f"[TRANSLATION_QUALITY] start balloon={balloon_tag} source={src} target={tgt}")
     print(f"[TRANSLATION] start balloon={balloon_tag} source={src} target={tgt}")
 
@@ -369,9 +400,8 @@ def translate_text(
         return cached
 
     last_error: Exception | None = None
+    last_invalid: tuple[str, str, str] | None = None  # (provider_label, output, reason)
     candidates: list[tuple[str, str]] = [(settings.provider, settings.model)]
-    if src == "ja" and tgt == "en" and settings.model != JA_EN_FALLBACK_MODEL:
-        candidates.append(("opus_mt", JA_EN_FALLBACK_MODEL))
 
     valid_candidates: list[tuple[str, str]] = []  # (provider_label, text)
 
@@ -403,6 +433,7 @@ def translate_text(
             if valid:
                 valid_candidates.append((label, cleaned))
                 break  # first valid attempt for this provider is enough
+            last_invalid = (label, cleaned, reason)
 
         if valid_candidates:
             # Got at least one valid candidate for this provider — stop unless
@@ -413,8 +444,17 @@ def translate_text(
         print(f"[TRANSLATION_FALLBACK] balloon={balloon_tag} from={provider}:{model_id} to=next reason=invalid_or_error")
 
     if not valid_candidates:
-        error = last_error or TranslationError(f"nao foi possivel traduzir {src}->{tgt}")
+        if last_error is not None:
+            error: Exception = last_error
+        elif last_invalid is not None:
+            label, out_text, reason = last_invalid
+            error = TranslationError(
+                f"modelo {src}->{tgt} ({label}) gerou saida invalida (motivo={reason}): \"{out_text}\""
+            )
+        else:
+            error = TranslationError(f"nao foi possivel traduzir {src}->{tgt}")
         print(f"[TRANSLATION_QUALITY_ERROR] balloon={balloon_tag} error={error}")
+        print(f"[TRANSLATION_ERROR] balloon={balloon_tag} error={error}")
         if isinstance(error, TranslationError):
             raise error
         raise TranslationError(str(error))
@@ -661,23 +701,88 @@ def _translate_transformers(text: str, source_lang: str, target_lang: str, model
     family = runtime.family
 
     num_beams = max(1, int(os.getenv("TRANSLATION_NUM_BEAMS", "1") or "1"))
+    print(f"[TRANSLATOR] model={model_id} family={family} source={source_lang} target={target_lang}")
 
-    if family == "m2m100":
+    forced_bos_id = None
+
+    if family == "nllb":
+        src_code = NLLB_LANG_MAP.get(source_lang, source_lang)
+        tgt_code = NLLB_LANG_MAP.get(target_lang, target_lang)
         try:
-            tokenizer.src_lang = source_lang
+            tokenizer.src_lang = src_code
         except Exception:
             pass
+        lang_to_id = getattr(tokenizer, "lang_code_to_id", {})
+        forced_bos_id = lang_to_id.get(tgt_code)
+        if forced_bos_id is None:
+            for k, v in lang_to_id.items():
+                if k.startswith(target_lang):
+                    forced_bos_id = v
+                    break
+        if forced_bos_id is None:
+            raise TranslationError(f"NLLB não tem código para target_lang={tgt_code}")
+        print(f"[TRANSLATOR_TOKENIZER] src_lang={src_code} target_lang={tgt_code} forced_bos={forced_bos_id}")
         encoded = tokenizer(text, return_tensors="pt", truncation=True, max_length=256)
         encoded = {k: v.to(runtime.device) for k, v in encoded.items()}
         with torch.no_grad():
             output_ids = model.generate(
                 **encoded,
-                forced_bos_token_id=tokenizer.get_lang_id(target_lang),
+                forced_bos_token_id=forced_bos_id,
+                max_new_tokens=192,
+                num_beams=num_beams,
+                early_stopping=(num_beams > 1),
+            )
+    elif family == "m2m100":
+        try:
+            tokenizer.src_lang = source_lang
+        except Exception:
+            pass
+        try:
+            forced_bos_id = tokenizer.get_lang_id(target_lang)
+        except Exception as exc:
+            raise TranslationError(f"m2m100 não tem código para target_lang={target_lang}: {exc}") from exc
+        print(f"[TRANSLATOR_TOKENIZER] src_lang={getattr(tokenizer, 'src_lang', '?')} target_lang={target_lang}")
+        print(f"[TRANSLATOR_GENERATE] forced_bos_token_id={forced_bos_id}")
+        encoded = tokenizer(text, return_tensors="pt", truncation=True, max_length=256)
+        encoded = {k: v.to(runtime.device) for k, v in encoded.items()}
+        with torch.no_grad():
+            output_ids = model.generate(
+                **encoded,
+                forced_bos_token_id=forced_bos_id,
+                max_new_tokens=192,
+                num_beams=num_beams,
+                early_stopping=(num_beams > 1),
+            )
+    elif family == "mbart":
+        mbart_src = _to_mbart_code(source_lang)
+        mbart_tgt = _to_mbart_code(target_lang)
+        try:
+            tokenizer.src_lang = mbart_src
+        except Exception:
+            pass
+        lang_map = getattr(tokenizer, "lang_code_to_id", None)
+        if lang_map is None:
+            raise TranslationError(
+                "tokenizer mbart sem lang_code_to_id; carregue MBart50TokenizerFast"
+            )
+        try:
+            forced_bos_id = lang_map[mbart_tgt]  # type: ignore[index]
+        except Exception as exc:
+            raise TranslationError(f"mbart não tem código para {mbart_tgt}: {exc}") from exc
+        print(f"[TRANSLATOR_TOKENIZER] src_lang={mbart_src} target_lang={mbart_tgt}")
+        print(f"[TRANSLATOR_GENERATE] forced_bos_token_id={forced_bos_id}")
+        encoded = tokenizer(text, return_tensors="pt", truncation=True, max_length=256)
+        encoded = {k: v.to(runtime.device) for k, v in encoded.items()}
+        with torch.no_grad():
+            output_ids = model.generate(
+                **encoded,
+                forced_bos_token_id=forced_bos_id,
                 max_new_tokens=192,
                 num_beams=num_beams,
                 early_stopping=(num_beams > 1),
             )
     elif family == "small100":
+        # SMALL100 forces target via tokenizer.tgt_lang (no forced_bos_token_id).
         try:
             tokenizer.tgt_lang = target_lang
         except Exception:
@@ -686,6 +791,8 @@ def _translate_transformers(text: str, source_lang: str, target_lang: str, model
             tokenizer.src_lang = source_lang
         except Exception:
             pass
+        print(f"[TRANSLATOR_TOKENIZER] src_lang={getattr(tokenizer, 'src_lang', '?')} target_lang={target_lang}")
+        print("[TRANSLATOR_GENERATE] forced_bos_token_id=None (small100 uses tgt_lang)")
         encoded = tokenizer(text, return_tensors="pt", truncation=True, max_length=256)
         encoded = {k: v.to(runtime.device) for k, v in encoded.items()}
         with torch.no_grad():
@@ -698,6 +805,8 @@ def _translate_transformers(text: str, source_lang: str, target_lang: str, model
     else:
         # Marian / opus-mt / generic seq2seq — the model already encodes the
         # language pair, so we just translate the raw text.
+        print(f"[TRANSLATOR_TOKENIZER] src_lang=- target_lang=- (model bakes pair: {model_id})")
+        print("[TRANSLATOR_GENERATE] forced_bos_token_id=None (marian)")
         encoded = tokenizer(text, return_tensors="pt", truncation=True, max_length=256)
         encoded = {k: v.to(runtime.device) for k, v in encoded.items()}
         with torch.no_grad():
@@ -709,6 +818,7 @@ def _translate_transformers(text: str, source_lang: str, target_lang: str, model
             )
 
     decoded = safe_text(tokenizer.decode(output_ids[0], skip_special_tokens=True)).strip()
+    print(f"[TRANSLATION_OUTPUT] text=\"{decoded}\"")
     with _debug_lock:
         _last_debug["raw"] = safe_text(output_ids[0].detach().cpu().tolist())
         _last_debug["decoded"] = decoded
@@ -772,10 +882,14 @@ def _translate_ctranslate2(text: str, source_lang: str, target_lang: str, model_
 
 def _detect_family(model_id: str) -> str:
     lower = model_id.lower()
+    if "nllb" in lower:
+        return "nllb"
     if "small100" in lower:
         return "small100"
     if "m2m100" in lower or "m2m_100" in lower:
         return "m2m100"
+    if "mbart" in lower:
+        return "mbart"
     return "marian"
 
 
@@ -792,19 +906,27 @@ def _get_transformers_runtime(model_id: str) -> _Seq2SeqRuntime:
         device_name = "cuda" if torch.cuda.is_available() and os.getenv("TRANSLATION_DEVICE", "cpu").lower() != "cpu" else "cpu"
         device = torch.device(device_name)
         auth_kwargs = hf_auth_kwargs()
-        load_kwargs = {"low_cpu_mem_usage": True}
+        family = _detect_family(model_id)
+        # ``low_cpu_mem_usage`` leaves Marian/opus-mt weights on meta tensors and
+        # then breaks on ``model.to(device)`` with "Cannot copy out of meta
+        # tensor". Disable it for that family — the models are small anyway.
+        load_kwargs: dict = {}
+        if family != "marian":
+            load_kwargs["low_cpu_mem_usage"] = True
         dtype_env = (os.getenv("TRANSLATION_DTYPE", "float32") or "float32").lower()
         if dtype_env in {"float16", "fp16", "half"}:
             load_kwargs["torch_dtype"] = torch.float16
         elif dtype_env in {"bfloat16", "bf16"}:
             load_kwargs["torch_dtype"] = torch.bfloat16
 
-        family = _detect_family(model_id)
-
         try:
-            if family == "m2m100":
+            if family == "nllb":
+                from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+                # NLLB-200 usa AutoTokenizer/AutoModel (não tem classe dedicada)
+                tokenizer = AutoTokenizer.from_pretrained(model_id, **auth_kwargs)
+                model = AutoModelForSeq2SeqLM.from_pretrained(model_id, **auth_kwargs, **load_kwargs)
+            elif family == "m2m100":
                 from transformers import M2M100ForConditionalGeneration, M2M100Tokenizer
-
                 tokenizer = M2M100Tokenizer.from_pretrained(model_id, **auth_kwargs)
                 model = M2M100ForConditionalGeneration.from_pretrained(model_id, **auth_kwargs, **load_kwargs)
             elif family == "small100":
@@ -817,6 +939,16 @@ def _get_transformers_runtime(model_id: str) -> _Seq2SeqRuntime:
                 except Exception:
                     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, **auth_kwargs)
                 model = AutoModelForSeq2SeqLM.from_pretrained(model_id, **auth_kwargs, **load_kwargs)
+            elif family == "mbart":
+                from transformers import MBartForConditionalGeneration
+
+                try:
+                    from transformers import MBart50TokenizerFast
+
+                    tokenizer = MBart50TokenizerFast.from_pretrained(model_id, **auth_kwargs)
+                except Exception:
+                    tokenizer = AutoTokenizer.from_pretrained(model_id, **auth_kwargs)
+                model = MBartForConditionalGeneration.from_pretrained(model_id, **auth_kwargs, **load_kwargs)
             else:
                 tokenizer = AutoTokenizer.from_pretrained(model_id, **auth_kwargs)
                 model = AutoModelForSeq2SeqLM.from_pretrained(model_id, **auth_kwargs, **load_kwargs)
